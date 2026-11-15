@@ -11,6 +11,7 @@ Video screensaver support\
 Xbox LED control supported\
 Exit, reboot, or shutdown from app\
 USB keyboard supported\
+MP3 player\
 and more!
 
 Currently, only password authentication is supported.
