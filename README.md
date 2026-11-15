@@ -22,6 +22,7 @@ Control + a (toggle antialiasing)\
 Control + f (switch font)\
 Control + = (increase font size)\
 Control + - (decrease font size)\
+Control + t (switch theme)\
 Control + p (Start or Stop MP3 player)\
 Control + Left Arrow (go back one song)\
 Control + Right Arrow (go back one song)\
