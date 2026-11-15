@@ -1,0 +1,28 @@
+XSSH v11.6.26 - nxdk-audio double-buffered PCM playback
+
+Build using the existing tools/fetch-deps.sh and tools/build-verified-release.sh.
+The audio driver subset and generated DSP word array are included in source.
+No new Cargo, CMake, or DSP-assembler installation is required for a normal build.
+
+Each song is fully decoded and converted to 48 kHz stereo s16 before playback.
+The PCM allocation targets 50 MiB while leaving an 8 MiB physical-memory reserve.
+Songs that exceed the actual allocation are skipped.
+Two physically contiguous 96 KiB hardware buffers feed the Xbox APU. The
+MP3 worker fills free slots every 5 ms. Interrupt/DPC callbacks never decode,
+copy PCM, access disk, allocate memory, or acquire SDL mutexes.
+
+Loading runs at low priority and displays "loading next mp3".
+Playback runs at high priority. Volume is applied by the hardware voice.
+Skip/seek/end-of-track wait up to 500 ms for confirmed stop before reusing buffers.
+Five-second seek commands use the latest completed hardware buffer position
+(512 ms granularity). Seek to the end proceeds to the next song.
+
+An unexpected hardware trap, command timeout, or stalled completion disables
+audio for the rest of this application run. CPU callbacks are disconnected
+during cleanup and uncertain DMA allocations are retained. Restart the Xbox
+after this condition to reclaim those allocations. The UI can continue running.
+
+Validation: the MP3 worker, adapter, and three driver C files were compiled for
+32-bit Windows/Pentium III using actual nxdk headers. Host tests simulate double
+buffer completion, partial tails, volume changes, seeking, queue errors, stop
+timeouts and stalled playback. Full linked XBE and Xbox playback are unverified.

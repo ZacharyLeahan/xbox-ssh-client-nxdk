@@ -1,0 +1,33 @@
+XSSH v11.6.27 - real-time HDD MP3 streaming
+
+Replaces whole-song preloading with incremental file reads, MP3 decoding, and
+48 kHz stereo conversion directly into free nxdk-audio hardware buffers.
+There is no 50 MiB PCM allocation and no song rejection based on decoded size.
+
+The two reusable 96 KiB buffers hold up to 1.024 seconds of audio.
+The first submission contains 24 KiB (128 ms) to reduce startup delay.
+Subsequent submissions use full slots, with short final buffers at EOF.
+The current decoder/file remain open during playback and close at track changes.
+
+The MP3 worker requests SDL_THREAD_PRIORITY_TIME_CRITICAL once at startup and
+keeps that priority through loading, playback and cleanup. If unsupported,
+it requests HIGH. Bounded decoding steps and brief explicit sleeps allow other
+threads to run. Disk callbacks check stop/deadline state between operations;
+they cannot interrupt a kernel disk read that is already blocked.
+
+Ctrl+Left/Right still select songs. Ctrl+Shift+Left/Right still seek five seconds
+from the last completed hardware-buffer position. Forward seeking decodes and
+discards incrementally. Backward seeking resets the decoder and advances in
+bounded steps; it can take longer late in a long track. Input and cancellation
+remain serviced between those steps. No full-file seek-index scan is added.
+Volume is applied by the hardware voice.
+
+The loading message clears after the first decoded submission.
+A hardware fault keeps the previous driver safeguards and disables audio.
+Full app restart may be required after a hardware fault.
+
+Validation includes Xbox-target compilation of the changed audio files, native
+buffer ownership/timeouts tests beyond 6 GiB of simulated PCM, and real dr_mp3
+and SDL conversion tests for a 330-second stereo MP3, a mono 22.05 kHz track,
+rewind, fast-forward and skipping. Native tests use a simulated APU.
+Full linked XBE and Xbox hardware playback remain unverified.

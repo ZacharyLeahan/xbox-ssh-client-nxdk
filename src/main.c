@@ -30,6 +30,7 @@
 #include "xssh_build.h"
 #include "xssh_led.h"
 #include "xssh_saver.h"
+#include "xssh_mp3.h"
 
 #define WIDTH 640
 #define HEIGHT 480
@@ -80,6 +81,9 @@ typedef struct {
     uint32_t cached_fg[TERM_MAX_ROWS][TERM_MAX_COLS];
     uint32_t cached_bg[TERM_MAX_ROWS][TERM_MAX_COLS];
     int cache_valid;
+    unsigned int cache_scan_cursor;
+    int cache_scan_active;
+    int cache_scan_again;
     int term_height;
     int font_resize_pending;
     int last_keyboard_present;
@@ -97,6 +101,11 @@ typedef struct {
     int shift;
     int key_col, key_row;
     char status[160];
+    char volume_status[40];
+    char ram_status[24];
+    unsigned int volume_status_until_ms;
+    unsigned int last_ram_poll_ms;
+    int ui_status_dirty;
     int sock;
     LIBSSH2_SESSION *session;
     LIBSSH2_CHANNEL *channel;
@@ -115,6 +124,7 @@ typedef struct {
     unsigned int saver_last_frame;
     int saver_active;
     XsshSaver saver;
+    XsshMp3 music;
     SDL_Texture *saver_texture;
     uint32_t *saver_rgba_buffer;
     int saver_rgb565_native;
@@ -138,6 +148,12 @@ static void logline(App *a,const char *s) {
 static void status(App *a,const char *s) {
     snprintf(a->status,sizeof(a->status),"%s",s);
     logline(a,s);
+}
+/* Local UI notifications should never contaminate the SSH terminal grid.
+   Music controls update only the fixed bottom status line. */
+static void status_bar_only(App *a,const char *s) {
+    snprintf(a->status,sizeof(a->status),"%s",s);
+    a->ui_status_dirty=1;
 }
 static char *trim(char *s) {
     while(*s==' '||*s=='\t')s++;
@@ -394,6 +410,10 @@ static void draw_terminal_cell(App *a,int x,int y,XsshThemeColors c){
     rect(a,px,py,a->terminal_glyph_w,a->terminal_glyph_h,bg);
     if(ch!=' ')render_terminal_glyph(a,px,py,a->terminal_glyph_w,a->terminal_glyph_h,ch,fg);
 }
+/* Bounds the amount of glyph work in each frame. A continuously updating
+   terminal (cmatrix/btop) must not monopolize the Xbox on screensaver exit. */
+#define TERMINAL_REDRAW_BUDGET 320u
+#define TERMINAL_REDRAW_BUDGET_MUSIC 640u
 /* Render into an SDL target texture only when cells change. If the nxdk SDL2
    backend cannot target textures, draw directly as a compatibility fallback. */
 static void draw_terminal(App *a,XsshThemeColors c){
@@ -401,21 +421,54 @@ static void draw_terminal(App *a,XsshThemeColors c){
     if(cache_ready && SDL_SetRenderTarget(a->renderer,a->term_cache)!=0){
         SDL_DestroyTexture(a->term_cache);a->term_cache=NULL;
         a->cache_valid=0;cache_ready=0;
+        a->cache_scan_active=0;a->cache_scan_again=0;
     }
     if(cache_ready){
         if(!a->cache_valid){
+            /* A real atlas/font/layout change requires a rebuild, unlike
+               screensaver dismissal which leaves the cache intact. */
             SDL_SetRenderDrawColor(a->renderer,c.background.r,c.background.g,c.background.b,255);
             SDL_RenderClear(a->renderer);
+            for(int y=0;y<a->term.rows;y++)
+                for(int x=0;x<a->term.cols;x++)a->cached_cells[y][x]=UINT32_MAX;
+            a->cache_valid=1;
+            a->cache_scan_cursor=0;
+            a->cache_scan_active=1;
+            a->cache_scan_again=0;
         }
-        if(a->term.dirty||!a->cache_valid){
-            for(int y=0;y<a->term.rows;y++)for(int x=0;x<a->term.cols;x++){
-                uint32_t ch=a->term.cells[y][x],fg=a->term.fg[y][x],bg=a->term.bg[y][x],attr=a->term.attr[y][x];
-                if(!a->cache_valid || a->cached_cells[y][x]!=ch || a->cached_fg[y][x]!=fg || a->cached_bg[y][x]!=bg || a->cached_attrs[y][x]!=attr){
+        /* Incoming output can arrive during a multi-frame scan. Remember it
+           and do a further pass so early cells can't be left outdated. */
+        if(a->term.dirty){
+            if(a->cache_scan_active)a->cache_scan_again=1;
+            else {a->cache_scan_cursor=0;a->cache_scan_active=1;}
+            a->term.dirty=0;
+        }
+        if(a->cache_scan_active){
+            unsigned int total=(unsigned int)a->term.cols*(unsigned int)a->term.rows;
+            /* Keep full-screen applications responsive even while MP3 is active.
+               Bound the per-pass work rather than starving the renderer. */
+            unsigned int budget=xssh_mp3_is_playing(&a->music)
+                ? TERMINAL_REDRAW_BUDGET_MUSIC : TERMINAL_REDRAW_BUDGET;
+            unsigned int end=a->cache_scan_cursor+budget;
+            if(end>total)end=total;
+            for(unsigned int i=a->cache_scan_cursor;i<end;i++){
+                int y=(int)(i/(unsigned int)a->term.cols);
+                int x=(int)(i%(unsigned int)a->term.cols);
+                uint32_t ch=a->term.cells[y][x],fg=a->term.fg[y][x],bg=a->term.bg[y][x];
+                unsigned char attr=a->term.attr[y][x];
+                if(a->cached_cells[y][x]!=ch || a->cached_fg[y][x]!=fg ||
+                   a->cached_bg[y][x]!=bg || a->cached_attrs[y][x]!=attr){
                     draw_terminal_cell(a,x,y,c);
-                    a->cached_cells[y][x]=ch;a->cached_fg[y][x]=fg;a->cached_bg[y][x]=bg;a->cached_attrs[y][x]=attr;
+                    a->cached_cells[y][x]=ch;a->cached_fg[y][x]=fg;
+                    a->cached_bg[y][x]=bg;a->cached_attrs[y][x]=attr;
                 }
             }
-            a->cache_valid=1;a->term.dirty=0;
+            a->cache_scan_cursor=end;
+            if(end==total){
+                a->cache_scan_cursor=0;
+                if(a->cache_scan_again){a->cache_scan_again=0;}
+                else a->cache_scan_active=0;
+            }
         }
         SDL_SetRenderTarget(a->renderer,NULL);
         SDL_Rect from={0,0,WIDTH,a->term_height},to={0,SCREEN_Y,WIDTH,a->term_height};
@@ -483,14 +536,6 @@ static void change_font_style(App *a){
     snprintf(a->status,sizeof(a->status),"Font: %s (Ctrl+F to cycle)",
              xssh_font_style_name(a->settings.font_style));
 }
-/* Runtime override: leave the on-disk xssh.cfg preference untouched. */
-static void toggle_text_antialiasing(App *a){
-    a->settings.text_antialiasing=!a->settings.text_antialiasing;
-    a->cache_valid=0;
-    a->term.dirty=1;
-    snprintf(a->status,sizeof(a->status),"Text antialiasing: %s (Ctrl+A)",
-             a->settings.text_antialiasing?"ON":"OFF");
-}
 static void startup_action(App *a,int selected){
     if(selected==0){a->menu_focus=0;a->form.field=XSSH_FORM_HOST;return;}
     if(selected==1){a->running=0;return;}
@@ -547,7 +592,9 @@ static void saver_stop(App *a){
     free(a->saver_rgba_buffer);a->saver_rgba_buffer=NULL;
     xssh_saver_close(&a->saver);
     a->saver_active=0;
-    a->cache_valid=0;
+    /* Keep the terminal target texture and its cell snapshot: the screensaver
+       only covered it, it did not invalidate it. A dirty pass will reconcile
+       the latest cmatrix/vim output incrementally after wake. */
     a->term.dirty=1;
     a->last_render_ms=0;
     update_front_led(a);
@@ -672,7 +719,19 @@ static void render(App *a) {
     }
     int usb_terminal=(a->stage==ST_CONNECTED && a->last_keyboard_present);
     rect(a,0,usb_terminal?450:326,WIDTH,1,c.foreground);
-    text_at(a,4,usb_terminal?451:329,a->status,c.foreground,78);
+    /* Show volume briefly after an adjustment; otherwise show live RAM use. */
+    const char *right_status =
+        (a->volume_status[0] &&
+         (int32_t)(a->volume_status_until_ms-SDL_GetTicks())>0)
+        ? a->volume_status : a->ram_status;
+    text_at(a,4,usb_terminal?451:329,a->status,c.foreground,
+            right_status[0]?58:78);
+    if(right_status[0]){
+        int len=(int)strlen(right_status);
+        if(len>19)len=19;
+        text_at(a,WIDTH-4-len*8,usb_terminal?451:329,
+                right_status,c.foreground,len);
+    }
     /* USB keyboard auto-hide remains unchanged in both themes. */
     if(xssh_software_keyboard_visible()) {
         for(int row=0;row<5;row++){
@@ -740,8 +799,25 @@ static int ssh_auth_complete(App *a) {
     if(libssh2_userauth_password(a->session,a->form.user,a->form.password)) {
         status(a,"Password authentication failed");return -1;
     }
-    a->channel=libssh2_channel_open_session(a->session);
-    if(!a->channel){status(a,"Could not open SSH channel");return -1;}
+    /* A moderate receive window reduces memory pressure on the 64 MiB Xbox.
+       RFC 4254 permits any positive initial window; 256 KiB is ample for a
+       terminal and much smaller than libssh2's usual multi-MiB default. */
+    a->channel=libssh2_channel_open_ex(a->session,"session",7,
+                                      256u*1024u,32u*1024u,NULL,0);
+    if(!a->channel){
+        char *detail=NULL;
+        int len=0;
+        int code=libssh2_session_last_error(a->session,&detail,&len,0);
+        char message[160];
+        if(detail && len>0){
+            if(len>92)len=92;
+            snprintf(message,sizeof(message),"SSH channel failed (%d): %.*s",code,len,detail);
+        }else{
+            snprintf(message,sizeof(message),"SSH channel failed (%d): no server details",code);
+        }
+        status(a,message);
+        return -1;
+    }
     if(libssh2_channel_request_pty_ex(a->channel,"xterm",5,NULL,0,
                                        a->term.cols,a->term.rows,0,0)!=0){
         status(a,"PTY request failed");return -1;
@@ -964,6 +1040,34 @@ static void nav(App *a,int dx,int dy) {
               (a->key_row==2)?11:(a->key_row==3)?10:14;
     if(a->key_col>=limit)a->key_col=limit-1;
 }
+static void music_toggle(App *a) {
+    char msg[160];
+    xssh_mp3_toggle(&a->music);
+    xssh_mp3_get_message(&a->music,msg,sizeof(msg));
+    status_bar_only(a,msg);
+}
+static void music_volume(App *a,int direction) {
+    char msg[160];
+    xssh_mp3_volume(&a->music,direction);
+    xssh_mp3_get_message(&a->music,msg,sizeof(msg));
+    snprintf(a->volume_status,sizeof(a->volume_status),"%s",msg);
+    a->volume_status_until_ms=SDL_GetTicks()+2000u;
+    a->ui_status_dirty=1;
+}
+static void music_skip(App *a,int direction){
+    xssh_mp3_skip(&a->music,direction);
+}
+static void music_seek(App *a,int direction){
+    xssh_mp3_seek(&a->music,direction);
+}
+static void toggle_theme(App *a){
+    a->settings.theme=(a->settings.theme==XSSH_THEME_XBOX)?
+        XSSH_THEME_INVERTED_XBOX:XSSH_THEME_XBOX;
+    /* Theme colors affect all terminal cells, not only changed text. */
+    a->cache_valid=0;
+    a->term.dirty=1;
+    a->ui_status_dirty=1;
+}
 static void keyboard_event(App*a,const SDL_KeyboardEvent *e) {
     if(e->repeat)return;
     if((e->keysym.mod & KMOD_CTRL) &&
@@ -975,8 +1079,18 @@ static void keyboard_event(App*a,const SDL_KeyboardEvent *e) {
        (e->keysym.sym==SDLK_MINUS || e->keysym.sym==SDLK_KP_MINUS)){
         change_font_size(a,-1);return;
     }
+    if((e->keysym.mod & KMOD_CTRL) &&
+       (e->keysym.sym==SDLK_LEFT || e->keysym.sym==SDLK_RIGHT)){
+        int dir=e->keysym.sym==SDLK_LEFT?-1:1;
+        if(e->keysym.mod & KMOD_SHIFT)music_seek(a,dir);
+        else music_skip(a,dir);
+        return;
+    }
+    if((e->keysym.mod & KMOD_CTRL) && e->keysym.sym==SDLK_t){toggle_theme(a);return;}
+    if((e->keysym.mod & KMOD_CTRL) && e->keysym.sym==SDLK_p){music_toggle(a);return;}
+    if((e->keysym.mod & KMOD_CTRL) && e->keysym.sym==SDLK_UP){music_volume(a,1);return;}
+    if((e->keysym.mod & KMOD_CTRL) && e->keysym.sym==SDLK_DOWN){music_volume(a,-1);return;}
     if((e->keysym.mod & KMOD_CTRL) && e->keysym.sym==SDLK_f){change_font_style(a);return;}
-    if((e->keysym.mod & KMOD_CTRL) && e->keysym.sym==SDLK_a){toggle_text_antialiasing(a);return;}
     if(a->stage==ST_POWER_CONFIRM){
         if(e->keysym.sym==SDLK_y || e->keysym.sym==SDLK_RETURN || e->keysym.sym==SDLK_KP_ENTER)confirm_power(a,1);
         else if(e->keysym.sym==SDLK_n || e->keysym.sym==SDLK_ESCAPE)confirm_power(a,0);
@@ -1006,6 +1120,7 @@ static void keyboard_event(App*a,const SDL_KeyboardEvent *e) {
     case SDLK_DOWN:send_sequence(a,"\033[B");break;
     case SDLK_RIGHT:send_sequence(a,"\033[C");break;
     case SDLK_LEFT:send_sequence(a,"\033[D");break;
+    case SDLK_a: if(e->keysym.mod & KMOD_CTRL)type_byte(a,1);break;
     case SDLK_c: if(e->keysym.mod & KMOD_CTRL)type_byte(a,3);break;
     default:break;
     }
@@ -1017,8 +1132,15 @@ static void usb_key_event(void *ctx,XsshKeyEvent event) {
     App *a=(App*)ctx;
     a->last_input_ms=SDL_GetTicks();
     if(a->saver_active){saver_stop(a);return;}
+    if(event.kind==XSSH_KEY_MUSIC_PREVIOUS){music_skip(a,-1);return;}
+    if(event.kind==XSSH_KEY_MUSIC_NEXT){music_skip(a,1);return;}
+    if(event.kind==XSSH_KEY_MUSIC_SEEK_BACK){music_seek(a,-1);return;}
+    if(event.kind==XSSH_KEY_MUSIC_SEEK_FORWARD){music_seek(a,1);return;}
+    if(event.kind==XSSH_KEY_MUSIC_TOGGLE){music_toggle(a);return;}
+    if(event.kind==XSSH_KEY_MUSIC_VOLUME_UP){music_volume(a,1);return;}
+    if(event.kind==XSSH_KEY_MUSIC_VOLUME_DOWN){music_volume(a,-1);return;}
     if(event.kind==XSSH_KEY_FONT_CYCLE){change_font_style(a);return;}
-    if(event.kind==XSSH_KEY_TOGGLE_ANTIALIASING){toggle_text_antialiasing(a);return;}
+    if(event.kind==XSSH_KEY_THEME_TOGGLE){toggle_theme(a);return;}
     if(a->stage==ST_POWER_CONFIRM){
         if(event.kind==XSSH_KEY_ENTER || (event.kind==XSSH_KEY_TEXT && (event.byte=='y'||event.byte=='Y')))confirm_power(a,1);
         else if(event.kind==XSSH_KEY_TEXT && (event.byte=='n'||event.byte=='N'||event.byte==27))confirm_power(a,0);
@@ -1050,7 +1172,14 @@ static void usb_key_event(void *ctx,XsshKeyEvent event) {
     case XSSH_KEY_FONT_INCREASE: change_font_size(a,1);break;
     case XSSH_KEY_FONT_DECREASE: change_font_size(a,-1);break;
     case XSSH_KEY_FONT_CYCLE: change_font_style(a);break;
-    case XSSH_KEY_TOGGLE_ANTIALIASING: toggle_text_antialiasing(a);break;
+    case XSSH_KEY_THEME_TOGGLE: toggle_theme(a);break;
+    case XSSH_KEY_MUSIC_PREVIOUS: music_skip(a,-1);break;
+    case XSSH_KEY_MUSIC_NEXT: music_skip(a,1);break;
+    case XSSH_KEY_MUSIC_SEEK_BACK: music_seek(a,-1);break;
+    case XSSH_KEY_MUSIC_SEEK_FORWARD: music_seek(a,1);break;
+    case XSSH_KEY_MUSIC_TOGGLE: music_toggle(a);break;
+    case XSSH_KEY_MUSIC_VOLUME_UP: music_volume(a,1);break;
+    case XSSH_KEY_MUSIC_VOLUME_DOWN: music_volume(a,-1);break;
     case XSSH_KEY_ENTER: enter(a);break;
     case XSSH_KEY_BACKSPACE: backspace(a);break;
     case XSSH_KEY_SEQUENCE: if(event.sequence)send_sequence(a,event.sequence);break;
@@ -1114,6 +1243,7 @@ int main(void) {
     App *a=(App*)calloc(1,sizeof(App));
     if(!a)return 1;
     a->sock=-1;a->running=1;
+    xssh_mp3_init(&a->music);
     a->last_input_ms=SDL_GetTicks();
     term_init(&a->term);
     /* Read configuration before initializing video. This also leaves the safe
@@ -1219,6 +1349,30 @@ int main(void) {
         poll_pad(a);
         resize_for_keyboard(a,0);
         ssh_pump(a);
+        xssh_mp3_pump(&a->music);
+        {char mp3_notice[160];
+         if(xssh_mp3_take_status(&a->music,mp3_notice,sizeof(mp3_notice)))
+             status_bar_only(a,mp3_notice);}
+        {unsigned int now=SDL_GetTicks();
+         if(now-a->last_ram_poll_ms>=1000u){
+             MM_STATISTICS mem;
+             memset(&mem,0,sizeof(mem));
+             mem.Length=sizeof(mem);
+             MmQueryStatistics(&mem);
+             if(mem.TotalPhysicalPages && mem.AvailablePages<=mem.TotalPhysicalPages){
+                 unsigned used=(unsigned)(((uint64_t)(mem.TotalPhysicalPages-mem.AvailablePages)*100u+
+                                         mem.TotalPhysicalPages/2u)/mem.TotalPhysicalPages);
+                 snprintf(a->ram_status,sizeof(a->ram_status),"RAM %u%%",used);
+             }else snprintf(a->ram_status,sizeof(a->ram_status),"RAM --%%");
+             a->last_ram_poll_ms=now;
+             a->ui_status_dirty=1;
+         }
+         if(a->volume_status[0] &&
+            (int32_t)(now-a->volume_status_until_ms)>=0){
+             a->volume_status[0]=0;
+             a->ui_status_dirty=1;
+         }
+        }
         {unsigned int now=SDL_GetTicks();
          if(!a->saver_active &&
             (unsigned int)(now-a->last_input_ms)>=(unsigned int)a->settings.screensaver_seconds*1000u)
@@ -1227,12 +1381,25 @@ int main(void) {
          /* Skip unnecessary full-screen redraws while the terminal is idle.
             Keystrokes and incoming SSH text still trigger an immediate redraw
             on the next ~30 FPS boundary. */
-         if(now-a->last_render_ms>=33){
-             if(a->saver_active){saver_draw(a,now);a->last_render_ms=now;}
-             else if(a->stage!=ST_CONNECTED || a->term.dirty || !a->cache_valid){
-                 render(a);a->last_render_ms=now;
+         /* Limit animation work during music, but keep drawing even if
+            the audio queue stalls or drains at the end of a song. */
+         unsigned render_interval=a->saver_active ?
+             (xssh_mp3_is_playing(&a->music) ? 160u : 33u) : 16u;
+         if(now-a->last_render_ms>=render_interval){
+             if(a->saver_active){
+                 saver_draw(a,now);a->last_render_ms=now;
+             }
+             else if(a->stage!=ST_CONNECTED || a->term.dirty || !a->cache_valid || a->cache_scan_active || a->ui_status_dirty){
+                 /* Never gate keyboard echo or terminal repaint on audio queue
+                    occupancy: a low/failed queue could otherwise freeze the
+                    display indefinitely. Audio has its own worker. */
+                 render(a);a->ui_status_dirty=0;a->last_render_ms=now;
              }
          }
+        }
+        if(!a->running && !xssh_mp3_stop(&a->music)){
+            a->running=1;
+            status_bar_only(a,"Audio shutdown pending; exit again when stopped");
         }
         SDL_Delay(2);
     }

@@ -23,7 +23,7 @@ TLS_C = aes asn1parse asn1write base64 bignum bignum_core bignum_mod bignum_mod_
 
 SRCS = $(CURDIR)/src/main.c $(CURDIR)/src/connect_form.c $(CURDIR)/src/known_hosts.c $(CURDIR)/src/font_size.c $(CURDIR)/src/font_style.c $(CURDIR)/src/terminal.c $(CURDIR)/src/theme.c $(CURDIR)/src/rng.c \
        $(CURDIR)/src/usb_keyboard.c $(CURDIR)/src/hid_keys.c \
-       $(CURDIR)/src/xssh_led.c $(CURDIR)/src/xssh_saver.c \
+       $(CURDIR)/src/xssh_led.c $(CURDIR)/src/xssh_saver.c $(CURDIR)/src/xssh_mp3.c \
        $(CURDIR)/src/video_modes.c $(CURDIR)/src/video_xbox.c \
        $(CURDIR)/src/network_config.c $(CURDIR)/src/network_xbox.c
 SRCS += $(addprefix $(SSHROOT)/src/,$(addsuffix .c,$(SSH_C)))
@@ -33,13 +33,19 @@ SRCS += $(addprefix $(TLSROOT)/library/,$(addsuffix .c,$(TLS_C)))
 # original Xbox may predefine _MSC_VER even when _WIN32 is undefined.
 # All compatibility branches in tools/patch-libssh2-nxdk.py require NXDK=1.
 NXDK_CFLAGS += -DNXDK=1 -U_WIN32 -std=gnu11 -O2 -I$(CURDIR)/include \
-    -I$(SSHROOT)/include -I$(SSHROOT)/src \
+    -I$(SSHROOT)/include -I$(SSHROOT)/src -I$(CURDIR)/third_party/dr_mp3 \
     -I$(TLSROOT)/include -I$(TLSROOT)/library \
     -DHAVE_CONFIG_H -DLIBSSH2_MBEDTLS \
     -DSDL_DISABLE_JOYSTICK_INIT_DELAY \
     -DMBEDTLS_CONFIG_FILE='"mbedtls_config_xbox.h"' \
     -DLIBSSH2_NO_MD5_PEM -DLIBSSH2_NO_RSA_SHA1 \
     -DLIBSSH2_NO_3DES -DLIBSSH2_NO_RC4 -DLIBSSH2_NO_BLOWFISH
+
+# Vendored streaming playback subset, pinned in third_party/nxdk-audio/UPSTREAM.md.
+NXAUDIO_ROOT := $(CURDIR)/third_party/nxdk-audio
+SRCS += $(CURDIR)/src/xssh_audio.c
+SRCS += $(NXAUDIO_ROOT)/audio_core.c $(NXAUDIO_ROOT)/audio_voice.c $(NXAUDIO_ROOT)/audio_buffer.c
+NXDK_CFLAGS += -I$(NXAUDIO_ROOT)/include
 
 include $(NXDK_DIR)/Makefile
 

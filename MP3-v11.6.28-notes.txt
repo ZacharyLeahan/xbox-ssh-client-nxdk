@@ -1,0 +1,24 @@
+XSSH v11.6.28 - fast checkpoint-based rewind
+
+Rewind restores a nearby decoder checkpoint instead of restarting at the beginning
+of the MP3. Checkpoints are collected as normal streaming or forward seeking
+progresses; no whole-file scan is added to startup or track changes.
+
+Each checkpoint preserves MP3 bit-reservoir/synthesis state and pending decoded
+samples. Compressed read-ahead is reread from the saved HDD offset. The existing
+incremental seek loop only decodes the remaining distance to the target.
+
+The cache holds at most 128 snapshots (about 4 MiB). It begins with roughly
+one-second spacing and thins older checkpoints as long tracks progress, keeping
+coverage of the played region. A 5.5-minute test track has roughly four-second
+spacing after compaction. Very long tracks have wider checkpoint spacing.
+If cache allocation fails, playback continues with the previous slower seek path.
+The cache is released on track change or stop. Audio still streams through the
+two 96 KiB hardware buffers at the existing maximum worker priority.
+
+Tests: Xbox-target compilation; real CBR, VBR and mono MP3 decoding; exact PCM
+comparison against uninterrupted decoding after checkpoint restore and cache
+compaction; late-track rewind/forward/skip through the actual worker; double
+buffer ownership and timeout checks. No full linked XBE or Xbox hardware test.
+The checkpoint implementation depends on the pinned dr_mp3 struct layout;
+rerun the PCM comparison test if the decoder dependency changes.

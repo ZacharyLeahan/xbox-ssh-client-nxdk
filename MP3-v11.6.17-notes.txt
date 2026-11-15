@@ -1,0 +1,11 @@
+XSSH v11.6.17 - fixed-format MP3 audio session
+
+- Open one SDL queued audio device at 48000 Hz, stereo, S16 for a playback session.
+- Use SDL_AudioStream to convert MP3s of supported sample rates and mono/stereo to output format.
+- Track skip, seek and EOF no longer close the SDL device.
+- Drain converted samples before EOF transition; bound converter backlog by draining before decoding again.
+- Queue target 900 ms, maximum 1400 ms, hard limit 1 MiB of SDL queued PCM.
+- Final shutdown still calls SDL_CloseAudioDevice once and may block if nxdk SDL driver is defective.
+- Error diagnostics continue to D:\xssh-mp3.log.
+
+Build and Xbox hardware testing not performed in this environment. Source-level tests passed.

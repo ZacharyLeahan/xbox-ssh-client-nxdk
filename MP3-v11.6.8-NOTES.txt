@@ -1,0 +1,11 @@
+XSSH v11.6.8 — rapid skip and backward seek improvements
+
+Based on v11.6.7; no overclocking code.
+
+- Coalesces rapid next/previous presses into one track transition after a
+  160 ms quiet interval, reducing SDL audio device churn on the Xbox.
+- Adds a sparse dr_mp3 seek table to accelerate backward seeking in VBR MP3s.
+- Pauses audio before clearing the queue during seeks and track transitions.
+- Preserves 5-second seek increments, MP3 controls and status-bar behavior.
+
+Note: Xbox hardware and full nxdk build have not been verified.

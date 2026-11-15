@@ -6,7 +6,7 @@
 #include <usbh_lib.h>
 #include <usbh_hid.h>
 
-#define REPORT_QUEUE 64u /* must be a power of two */
+#define REPORT_QUEUE 256u /* must be a power of two */
 
 typedef struct {
     HID_DEV_T *dev;
@@ -18,6 +18,7 @@ static unsigned int queue_head,queue_tail;
 static HID_DEV_T *active;
 static XsshHidKeys keys;
 static int connected;
+static unsigned int report_overflow;
 
 /* Runs in the USB transfer callback context: DO NOT call SDL or libssh2 here.
    Release/acquire atomics protect reports from a concurrent main loop. */
@@ -26,7 +27,9 @@ static void on_report(HID_DEV_T *dev,uint16_t ep,int err,uint8_t *buf,uint32_t n
     if(err || !buf || n<8 || dev!=active)return;
     unsigned int tail=__atomic_load_n(&queue_tail,__ATOMIC_RELAXED);
     unsigned int next=(tail+1u)&(REPORT_QUEUE-1u);
-    if(next==__atomic_load_n(&queue_head,__ATOMIC_ACQUIRE))return; /* overflow */
+    if(next==__atomic_load_n(&queue_head,__ATOMIC_ACQUIRE)){
+        __atomic_store_n(&report_overflow,1u,__ATOMIC_RELEASE);return;
+    }
     queue[tail].dev=dev;
     memcpy(queue[tail].report,buf,8);
     __atomic_store_n(&queue_tail,next,__ATOMIC_RELEASE);
@@ -38,6 +41,7 @@ void xssh_usb_keyboard_init(void) {
     __atomic_store_n(&queue_head,0,__ATOMIC_RELAXED);
     __atomic_store_n(&queue_tail,0,__ATOMIC_RELAXED);
     xssh_hid_keys_reset(&keys);
+    __atomic_store_n(&report_overflow,0u,__ATOMIC_RELAXED);
     usbh_hid_init();
 }
 
@@ -58,6 +62,7 @@ void xssh_usb_keyboard_poll(uint32_t now_ms,XsshKeySink sink,void *ctx) {
     /* SDL_PollEvent will have called usbh_pooling_hubs() via joystick detect. */
     HID_DEV_T *present=find_keyboard();
     if(present != active) {
+        /* A removed keyboard must not leave a held seek running. */
         /* The old device, if any, is already disconnected/owned by USB core.
            Ignore stale queued reports rather than dereferencing the pointer. */
         active=NULL;
@@ -76,6 +81,11 @@ void xssh_usb_keyboard_poll(uint32_t now_ms,XsshKeySink sink,void *ctx) {
             else active=NULL;
         }
         /* On failed init retry only on a future frame. */
+    }
+    if(__atomic_exchange_n(&report_overflow,0u,__ATOMIC_ACQ_REL)){
+        /* Never trust stale held-key state after losing a HID report. */
+        xssh_hid_keys_reset(&keys);
+        __atomic_store_n(&queue_head,__atomic_load_n(&queue_tail,__ATOMIC_ACQUIRE),__ATOMIC_RELEASE);
     }
     for(;;) {
         unsigned int head=__atomic_load_n(&queue_head,__ATOMIC_RELAXED);

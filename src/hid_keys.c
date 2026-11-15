@@ -99,8 +99,22 @@ static void send_key(XsshHidKeys *s,uint8_t key,uint8_t mods,
     if(ctrl && (key==0x2d || key==0x56)) {
         emit_special(sink,ctx,XSSH_KEY_FONT_DECREASE);return;
     }
-    if(ctrl && key==0x04) { /* HID A = Ctrl+A: toggle local font antialiasing. */
-        emit_special(sink,ctx,XSSH_KEY_TOGGLE_ANTIALIASING);return;
+    if(ctrl && key==0x17) { /* Ctrl+T */
+        emit_special(sink,ctx,XSSH_KEY_THEME_TOGGLE);return;
+    }
+    if(ctrl && key==0x13) { /* Ctrl+P */
+        emit_special(sink,ctx,XSSH_KEY_MUSIC_TOGGLE);return;
+    }
+    if(ctrl && (key==0x50 || key==0x4f)) { /* Ctrl+Left/Right */
+        emit_special(sink,ctx,shift ?
+            (key==0x50 ? XSSH_KEY_MUSIC_SEEK_BACK : XSSH_KEY_MUSIC_SEEK_FORWARD) :
+            (key==0x50 ? XSSH_KEY_MUSIC_PREVIOUS : XSSH_KEY_MUSIC_NEXT));return;
+    }
+    if(ctrl && key==0x52) { /* Ctrl+Up */
+        emit_special(sink,ctx,XSSH_KEY_MUSIC_VOLUME_UP);return;
+    }
+    if(ctrl && key==0x51) { /* Ctrl+Down */
+        emit_special(sink,ctx,XSSH_KEY_MUSIC_VOLUME_DOWN);return;
     }
     if(ctrl && key==0x09) { /* HID F = Ctrl+F: cycle local font. */
         emit_special(sink,ctx,XSSH_KEY_FONT_CYCLE);return;
@@ -142,7 +156,7 @@ void xssh_hid_keys_report(XsshHidKeys *s,const uint8_t report[8],
         uint8_t key=report[i];
         if(!key || in_report(s->previous,key))continue;
         send_key(s,key,report[0],sink,ctx);
-        if(key!=0x39 && key!=0x53)next_repeat=key;
+        if(key!=0x39 && key!=0x53 && !(report[0]&MOD_CTRL && (key==0x50 || key==0x4f)))next_repeat=key;
     }
     if(next_repeat) {
         s->repeat_key=next_repeat;

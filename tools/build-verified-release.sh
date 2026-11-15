@@ -15,7 +15,7 @@ if ! command -v nxdk-cc >/dev/null 2>&1; then
   echo 'ERROR: nxdk-cc not found. Activate nxdk in this shell.' >&2
   exit 1
 fi
-if [[ ! -d third_party/libssh2/src || ! -d third_party/mbedtls/library ]]; then
+if [[ ! -d third_party/libssh2/src || ! -d third_party/mbedtls/library || ! -s third_party/dr_mp3/dr_mp3.h ]]; then
   echo 'ERROR: dependencies missing: run ./tools/fetch-deps.sh first' >&2
   exit 1
 fi

@@ -177,4 +177,4 @@ screensaver_enabled=yes
 screensaver_seconds=120
 screensaver_file=D:\screensaver.xsv
 
-# Ctrl+A toggles antialiasing at runtime without saving to this file.
+# Antialiasing is configured here; Ctrl+A is forwarded to the SSH session.

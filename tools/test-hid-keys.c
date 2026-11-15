@@ -94,9 +94,26 @@ int main(void) {
     report(&s,&c,0x11,0x09,2560); /* Ctrl+F */
     assert(c.events[25].kind==XSSH_KEY_FONT_CYCLE);
     report(&s,&c,0,0,2570);
-    report(&s,&c,0x11,0x04,2580); /* Ctrl+A is local, not ASCII SOH */
-    assert(c.events[26].kind==XSSH_KEY_TOGGLE_ANTIALIASING);
+    report(&s,&c,0x11,0x04,2580); /* Ctrl+A is forwarded to remote terminal */
+    check_byte(&c,26,1);
     report(&s,&c,0,0,2590);
+    report(&s,&c,0x11,0x13,2600); /* Ctrl+P */
+    assert(c.events[27].kind==XSSH_KEY_MUSIC_TOGGLE);
+    report(&s,&c,0,0,2610);
+    report(&s,&c,0x11,0x52,2620); /* Ctrl+Up */
+    assert(c.events[28].kind==XSSH_KEY_MUSIC_VOLUME_UP);
+    report(&s,&c,0,0,2630);
+    report(&s,&c,0x11,0x51,2640); /* Ctrl+Down */
+    assert(c.events[29].kind==XSSH_KEY_MUSIC_VOLUME_DOWN);
+    report(&s,&c,0,0,2650);
+    report(&s,&c,0,0x13,2660); /* Ordinary p still passes through. */
+    check_byte(&c,30,'P');
+    report(&s,&c,0,0,2670);
+    report(&s,&c,0x11,0x17,2680); /* Ctrl+T is local theme toggle */
+    assert(c.events[31].kind==XSSH_KEY_THEME_TOGGLE);
+    report(&s,&c,0,0,2690);
+    report(&s,&c,0,0x17,2700); /* Plain T still reaches remote */
+    assert(c.events[32].kind==XSSH_KEY_TEXT);
     printf("HID keyboard decode tests: OK (%d emitted events)\n",c.count);
     return 0;
 }
