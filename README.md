@@ -12,6 +12,7 @@ Xbox LED control supported\
 Exit, reboot, or shutdown from app\
 USB keyboard supported\
 MP3 player\
+Key or Password based authentication\
 and more!
 
 Currently, only password authentication is supported.
