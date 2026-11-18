@@ -12,6 +12,7 @@ static char *field_ptr(XsshConnectForm *f, int field, size_t *cap) {
     case XSSH_FORM_HOST: *cap=sizeof(f->host);return f->host;
     case XSSH_FORM_PORT: *cap=sizeof(f->port);return f->port;
     case XSSH_FORM_USER: *cap=sizeof(f->user);return f->user;
+    case XSSH_FORM_KEY_FILE: *cap=sizeof(f->key_file);return f->key_file;
     case XSSH_FORM_PASSWORD: *cap=sizeof(f->password);return f->password;
     default: *cap=0;return NULL;
     }
@@ -82,11 +83,12 @@ int xssh_form_validate(const XsshConnectForm *f, int field) {
     case XSSH_FORM_HOST:return valid_ipv4(f->host) && strcmp(f->host,"255.255.255.255")!=0;
     case XSSH_FORM_PORT:return xssh_form_port(f)>0;
     case XSSH_FORM_USER:return f->user[0]!=0;
-    case XSSH_FORM_PASSWORD:return f->password[0]!=0;
+    case XSSH_FORM_KEY_FILE:return 1; /* Empty selects password login. */
+    case XSSH_FORM_PASSWORD:return f->key_file[0]!=0 || f->password[0]!=0;
     default:return 0;
     }
 }
 const char *xssh_form_field_name(int field) {
-    static const char *names[]={"SERVER IP","PORT","USERNAME","PASSWORD"};
+    static const char *names[]={"SERVER IP","PORT","USERNAME","KEY FILE","PASSWORD"};
     return field>=0 && field<XSSH_FORM_COUNT?names[field]:"UNKNOWN";
 }

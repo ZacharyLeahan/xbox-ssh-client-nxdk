@@ -6,11 +6,13 @@
 #define XSSH_PORT_MAX 6
 #define XSSH_USER_MAX 80
 #define XSSH_PASSWORD_MAX 128
+#define XSSH_KEY_PATH_MAX 160
 
 typedef enum {
     XSSH_FORM_HOST = 0,
     XSSH_FORM_PORT,
     XSSH_FORM_USER,
+    XSSH_FORM_KEY_FILE,
     XSSH_FORM_PASSWORD,
     XSSH_FORM_COUNT
 } XsshFormField;
@@ -19,6 +21,7 @@ typedef struct {
     char host[XSSH_HOST_MAX];
     char port[XSSH_PORT_MAX];
     char user[XSSH_USER_MAX];
+    char key_file[XSSH_KEY_PATH_MAX];
     char password[XSSH_PASSWORD_MAX];
     int field;
     unsigned char replace_on_type[XSSH_FORM_COUNT];

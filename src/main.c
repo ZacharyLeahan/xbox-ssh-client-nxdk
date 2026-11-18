@@ -13,6 +13,8 @@
 #include <lwip/inet.h>
 #include <libssh2.h>
 #include <mbedtls/sha256.h>
+#include <mbedtls/pk.h>
+#include <mbedtls/error.h>
 #include "font8x12.h"
 #include "font8x12_aa.h"
 #include "unicode_glyphs.h"
@@ -54,6 +56,7 @@ typedef struct {
     char host[80];
     int port;
     char user[80];
+    char key_file[XSSH_KEY_PATH_MAX];
     char pin[65];
     char video_mode[48];
     XsshTheme theme;
@@ -187,6 +190,7 @@ static int load_settings(Settings *s) {
         p=trim(p);eq=trim(eq);
         if(!strcmp(p,"host"))snprintf(s->host,sizeof(s->host),"%s",eq);
         else if(!strcmp(p,"user"))snprintf(s->user,sizeof(s->user),"%s",eq);
+        else if(!strcmp(p,"private_key"))snprintf(s->key_file,sizeof(s->key_file),"%s",eq);
         else if(!strcmp(p,"port"))s->port=atoi(eq);
         else if(!strcmp(p,"hostkey_sha256"))snprintf(s->pin,sizeof(s->pin),"%s",eq);
         else if(!strcmp(p,"video_mode"))snprintf(s->video_mode,sizeof(s->video_mode),"%s",eq);
@@ -679,7 +683,7 @@ static void render(App *a) {
         text_at(a,14,119,a->pending_hostkey,c.foreground,65);
         text_at(a,14,167,"Compare this fingerprint using a trusted source.",c.foreground,76);
         text_at(a,14,192,"B / Enter = TRUST & CONNECT",c.foreground,76);
-        text_at(a,14,215,"X / Esc = CANCEL (no password sent)",c.foreground,76);
+        text_at(a,14,215,"X / Esc = CANCEL (no authentication sent)",c.foreground,76);
         text_at(a,14,246,"Trusted keys saved as D:\\xssh-known-hosts.txt",c.foreground,76);
     } else {
         text_at(a,14,47,"CONNECT TO SSH SERVER",c.foreground,60);
@@ -688,22 +692,25 @@ static void render(App *a) {
         for(int field=0;field<XSSH_FORM_COUNT;field++) {
             const char *value=(field==XSSH_FORM_HOST)?a->form.host:
                               (field==XSSH_FORM_PORT)?a->form.port:
-                              (field==XSSH_FORM_USER)?a->form.user:a->form.password;
+                              (field==XSSH_FORM_USER)?a->form.user:
+                              (field==XSSH_FORM_KEY_FILE)?a->form.key_file:a->form.password;
             char display[80];
             if(field==XSSH_FORM_PASSWORD){
                 size_t n=strlen(value);if(n>sizeof(display)-1)n=sizeof(display)-1;
                 memset(display,'*',n);display[n]=0;
             }else snprintf(display,sizeof(display),"%s",value);
-            int y=77+field*43;
+            int y=77+field*34;
+            const char *label=(field==XSSH_FORM_PASSWORD && a->form.key_file[0])?
+                              "PASSPHRASE":xssh_form_field_name(field);
             if(a->stage==ST_FORM && a->form.field==field) {
                 rect(a,8,y-5,624,26,c.foreground);
-                text_at(a,14,y,xssh_form_field_name(field),c.background,12);
+                text_at(a,14,y,label,c.background,12);
                 text_at(a,150,y,display,c.background,58);
                 int cursor_x=150+(int)strlen(display)*8;
                 if(cursor_x<615)rect(a,cursor_x,y+11,7,2,c.background);
             } else {
                 outline(a,8,y-5,624,26,c.foreground);
-                text_at(a,14,y,xssh_form_field_name(field),c.foreground,12);
+                text_at(a,14,y,label,c.foreground,12);
                 text_at(a,150,y,display,c.foreground,58);
             }
         }
@@ -796,9 +803,83 @@ static int match_pin(const char *pin, const char *computed) {
     return diff==0;
 }
 static int ssh_auth_complete(App *a) {
-    if(libssh2_userauth_password(a->session,a->form.user,a->form.password)) {
-        status(a,"Password authentication failed");return -1;
+    int auth_result;
+    if(a->form.key_file[0]) {
+        /* Host verification has already succeeded. Never fall back to sending
+           a key passphrase as an account password. Derive the public RSA key
+           from the private PEM file; no separate .pub file is required. */
+        /* Diagnostic preflight: verify file access and recognizable PEM envelope.
+           This does not parse/decrypt the key or change the auth mechanism. */
+        FILE *key=fopen(a->form.key_file,"rb");
+        if(!key){status(a,"SSH key stage=file-open: cannot open private key");return -1;}
+        char header[96]={0};
+        size_t read_count=fread(header,1,sizeof(header)-1,key);
+        int read_error=ferror(key);
+        fclose(key);
+        if(read_error){status(a,"SSH key stage=file-read: I/O error");return -1;}
+        if(read_count==0){status(a,"SSH key stage=file-read: empty key file");return -1;}
+        const char *format="unknown";
+        if(strstr(header,"-----BEGIN RSA PRIVATE KEY-----"))format="RSA-PEM";
+        else if(strstr(header,"-----BEGIN PRIVATE KEY-----"))format="PKCS8-PEM";
+        else if(strstr(header,"-----BEGIN ENCRYPTED PRIVATE KEY-----"))format="PKCS8-encrypted";
+        else if(strstr(header,"-----BEGIN OPENSSH PRIVATE KEY-----"))format="OpenSSH";
+        if(!strcmp(format,"unknown")){
+            status(a,"SSH key stage=header: unrecognized private key header");
+            return -1;
+        }
+        /* Independent Mbed TLS private-key parsing check. This is diagnostic
+           only: libssh2 still owns authentication and RSA signing. Do not
+           print private-key material or passphrases. */
+        {
+            mbedtls_pk_context parsed;
+            int parse_rc;
+            char message[160];
+            mbedtls_pk_init(&parsed);
+            parse_rc=mbedtls_pk_parse_keyfile(&parsed,a->form.key_file,
+                a->form.password[0]?a->form.password:NULL,NULL,NULL);
+            if(parse_rc!=0){
+                char explanation[80]={0};
+                mbedtls_strerror(parse_rc,explanation,sizeof(explanation));
+                snprintf(message,sizeof(message),
+                    "Key stage=mbedtls-parse rc=%d: %.75s",parse_rc,explanation);
+                mbedtls_pk_free(&parsed);
+                status(a,message);
+                return -1;
+            }
+            if(!mbedtls_pk_can_do(&parsed,MBEDTLS_PK_RSA)){
+                mbedtls_pk_free(&parsed);
+                status(a,"Key stage=mbedtls-parse: key is not RSA");
+                return -1;
+            }
+            mbedtls_pk_free(&parsed);
+        }
+        /* The original libssh2 authentication call remains authoritative.
+           Its return value is captured immediately; its session error is
+           sampled before any further libssh2 calls. */
+        auth_result=libssh2_userauth_publickey_fromfile_ex(a->session,
+            a->form.user,(unsigned int)strlen(a->form.user),NULL,
+            a->form.key_file,a->form.password[0]?a->form.password:NULL);
+        if(auth_result) {
+            char *detail=NULL;
+            int len=0;
+            int code=libssh2_session_last_error(a->session,&detail,&len,0);
+            char message[160];
+            if(detail && len>0){
+                if(len>52)len=52;
+                snprintf(message,sizeof(message),"RSA parsed; auth rc=%d last=%d: %.*s",
+                         auth_result,code,len,detail);
+            }else{
+                snprintf(message,sizeof(message),"RSA parsed; auth rc=%d last=%d (sign/server?)",
+                         auth_result,code);
+            }
+            status(a,message);
+            return -1;
+        }
+    } else {
+        auth_result=libssh2_userauth_password(a->session,a->form.user,a->form.password);
+        if(auth_result){status(a,"Password authentication failed");return -1;}
     }
+    xssh_form_zero_password(&a->form);
     /* A moderate receive window reduces memory pressure on the 64 MiB Xbox.
        RFC 4254 permits any positive initial window; 256 KiB is ample for a
        terminal and much smaller than libssh2's usual multi-MiB default. */
@@ -889,7 +970,7 @@ static int ssh_connect(App *a) {
             memcpy(a->pending_hostkey,fingerprint,sizeof(fingerprint));
             a->stage=ST_VERIFY_HOST;
             status(a,"Unknown server key: verify SHA-256 fingerprint before trusting");
-            return 1; /* Stay connected, but DO NOT send password yet. */
+            return 1; /* Stay connected, but DO NOT authenticate yet. */
         }
     }
     status(a,"Host key verified; authenticating...");render(a);
@@ -905,7 +986,7 @@ static void reject_unknown_host(App *a) {
     memset(a->pending_hostkey,0,sizeof(a->pending_hostkey));
     a->stage=ST_FORM;
     a->form.field=XSSH_FORM_PASSWORD;
-    status(a,"Host key not trusted; password was not sent");
+    status(a,"Host key not trusted; authentication was not sent");
 }
 static void trust_host_and_authenticate(App *a) {
     if(xssh_known_host_add(KNOWN_HOSTS_FILE,a->form.host,
@@ -1284,6 +1365,8 @@ int main(void) {
     }
     if(a->video.warning[0])logline(a,a->video.warning);
     xssh_form_init(&a->form,a->settings.host,a->settings.port,a->settings.user);
+    snprintf(a->form.key_file,sizeof(a->form.key_file),"%s",a->settings.key_file);
+    a->form.replace_on_type[XSSH_FORM_KEY_FILE]=a->form.key_file[0]!=0;
     if(!settings_ok){
         status(a,settings_result == -5 ?
                "Invalid LED or screensaver setting in D:\\xssh.cfg" :
@@ -1309,7 +1392,7 @@ int main(void) {
                 status(a,"libssh2_init failed");
             else {
                 a->ready=1; a->stage=ST_FORM;
-                status(a,"Enter server IP, port, username, password; B/Enter advances");
+                status(a,"Enter server, user, optional key file and secret; B/Enter advances");
             }
         }
     }

@@ -38,7 +38,6 @@ NXDK_CFLAGS += -DNXDK=1 -U_WIN32 -std=gnu11 -O2 -I$(CURDIR)/include \
     -DHAVE_CONFIG_H -DLIBSSH2_MBEDTLS \
     -DSDL_DISABLE_JOYSTICK_INIT_DELAY \
     -DMBEDTLS_CONFIG_FILE='"mbedtls_config_xbox.h"' \
-    -DLIBSSH2_NO_MD5_PEM -DLIBSSH2_NO_RSA_SHA1 \
     -DLIBSSH2_NO_3DES -DLIBSSH2_NO_RC4 -DLIBSSH2_NO_BLOWFISH
 
 # Vendored streaming playback subset, pinned in third_party/nxdk-audio/UPSTREAM.md.
