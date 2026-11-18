@@ -15,8 +15,6 @@ MP3 player\
 Key or Password based authentication\
 and more!
 
-Currently, only password authentication is supported.
-
 ## Shortcuts
 
 Control + a (toggle antialiasing)\
