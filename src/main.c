@@ -2096,10 +2096,8 @@ int main(void) {
             the audio queue stalls or drains at the end of a song. */
          /* The GPU screensaver blits one native-size texture; do not force
             it down to ~6 FPS just because MP3 audio is playing. */
-         /* 1080i has four times the pixel count of 540p and SDL is CPU
-            rendered here for safety. Do not repeatedly redraw an unchanged
-            login form at 60 FPS; redraw promptly for input/status changes.
-            Connected sessions retain their existing dirty-cell behavior. */
+         /* Leave time for USB polling between input and status changes.
+            Even at 720p the GPU path rasterizes the form on the CPU. */
          int high_res_sdl=!a->gpu_active && a->video.width>=1920 && a->video.height>=1080;
          unsigned render_interval=a->saver_active ? (high_res_sdl?50u:33u) :
                                   (high_res_sdl?33u:16u);
@@ -2108,7 +2106,7 @@ int main(void) {
                  saver_draw(a,now);a->last_render_ms=now;
              }
              else if(a->stage!=ST_CONNECTED ?
-                 (!high_res_sdl || a->stage!=a->last_rendered_stage ||
+                 (a->stage!=a->last_rendered_stage ||
                   a->last_render_ms==0 || a->last_input_ms>=a->last_render_ms ||
                   a->ui_status_dirty || a->font_resize_pending) :
                  (a->term.dirty || !a->cache_valid || a->cache_scan_active || a->ui_status_dirty)){
