@@ -13,6 +13,10 @@ Exit, reboot, or shutdown from app\
 USB keyboard supported\
 MP3 player\
 Key or Password based authentication\
+Numpad drumming\
+Custom .bmp wallpapers\
+Custom screen margins\
+GPU acceleration\
 and more!
 
 ## Shortcuts
@@ -25,8 +29,13 @@ Control + p (Start or Stop MP3 player)\
 Control + Left Arrow (go back one song)\
 Control + Right Arrow (go forward one song)\
 Control + Shift + Left Arrow (rewind song)\
-Control + Shift + Right Arrow (fast forward song)
-
+Control + Shift + Right Arrow (fast forward song)\
+Control + Spacebar (Enable or Disable numpad drumming)\
+Numpad + (Increase drum volume)\
+Numpad - (Decrease drum volume)\
+Control + Shift + B (Switch wallpapers)\
+Control + Shift + O (Change wallpaper opacity)\
+Control + Shift + M (Change screen margins)
 
 ## To build from source:
 
