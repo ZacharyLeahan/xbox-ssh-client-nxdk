@@ -171,6 +171,7 @@ typedef struct {
     XsshMp3 music;
     XsshDrums drums;
     SDL_Texture *wallpaper_texture;
+    void *wallpaper_backdrop;
     int wallpaper_width,wallpaper_height;
     char wallpaper_current[256];
     int wallpaper_opacity;
@@ -894,6 +895,7 @@ static int wallpaper_load(App *a,const char *path){
     SDL_SetTextureBlendMode(texture,SDL_BLENDMODE_BLEND);
     if(a->wallpaper_texture)SDL_DestroyTexture(a->wallpaper_texture);
     a->wallpaper_texture=texture;
+    free(a->wallpaper_backdrop);a->wallpaper_backdrop=NULL;
     a->wallpaper_width=w;a->wallpaper_height=height;
     a->cache_valid=0;
     snprintf(a->wallpaper_current,sizeof(a->wallpaper_current),"%s",path);
@@ -946,6 +948,7 @@ static void wallpaper_next(App *a){
     }
 }
 static void wallpaper_step(App *a){
+    free(a->wallpaper_backdrop);a->wallpaper_backdrop=NULL;
     a->wallpaper_opacity=(a->wallpaper_opacity+1)%101;
     /* Show the current level on the bottom status bar on every step,
        including the gradual updates while Ctrl+Shift+O is held. */
@@ -956,6 +959,7 @@ static void wallpaper_step(App *a){
     a->last_render_ms=0;
 }
 static void wallpaper_margin_step(App *a){
+    free(a->wallpaper_backdrop);a->wallpaper_backdrop=NULL;
     a->wallpaper_margin=(a->wallpaper_margin+5)%30;
     /* Inset the UI at native pixel size; never resample bitmap glyphs. */
     g_screen_width=g_output_width-2*(g_output_width*a->wallpaper_margin/100);
@@ -977,9 +981,24 @@ static void display_margin_apply(App *a){
     SDL_RenderSetScale(a->renderer,1.0f,1.0f);
     SDL_RenderSetViewport(a->renderer,&viewport);
 }
+/* This surface always has 32-bit pixels and a word-aligned pitch. Copy words
+   so nxdk's byte-at-a-time libc memcpy doesn't dominate a 720p restore. */
+static void copy_backdrop(uint32_t *restrict dst,const uint32_t *restrict src,size_t bytes){
+    for(size_t i=0;i<bytes/sizeof(*dst);i++)dst[i]=src[i];
+}
 static void display_margin_clear(App *a){
     SDL_RenderSetScale(a->renderer,1.0f,1.0f);
     SDL_RenderSetViewport(a->renderer,NULL);
+    /* The software renderer targets a persistent RAM surface in GPU mode.
+       Restore the already scaled and blended backdrop before painting UI. */
+    SDL_Surface *surface=a->gpu_active?a->gpu_surface:NULL;
+    size_t bytes=surface?(size_t)surface->pitch*surface->h:0;
+    if(surface && a->wallpaper_backdrop){
+        SDL_RenderFlush(a->renderer);
+        copy_backdrop(surface->pixels,a->wallpaper_backdrop,bytes);
+        display_margin_apply(a);
+        return;
+    }
     SDL_SetRenderDrawColor(a->renderer,0,0,0,255);
     SDL_RenderClear(a->renderer);
     if(!a->margin_effects_wallpaper && a->wallpaper_texture && a->wallpaper_opacity>0){
@@ -988,6 +1007,18 @@ static void display_margin_clear(App *a){
         SDL_RenderCopy(a->renderer,a->wallpaper_texture,NULL,&full);
     }
     display_margin_apply(a);
+    if(a->margin_effects_wallpaper && a->wallpaper_texture && a->wallpaper_opacity>0){
+        SDL_SetTextureAlphaMod(a->wallpaper_texture,(Uint8)(a->wallpaper_opacity*255/100));
+        SDL_Rect dest=wallpaper_bounds(a);
+        SDL_RenderCopy(a->renderer,a->wallpaper_texture,NULL,&dest);
+    }
+    if(surface && a->wallpaper_texture && a->wallpaper_opacity>0){
+        a->wallpaper_backdrop=malloc(bytes);
+        if(a->wallpaper_backdrop){
+            SDL_RenderFlush(a->renderer);
+            copy_backdrop(a->wallpaper_backdrop,surface->pixels,bytes);
+        }
+    }
 }
 static void render(App *a) {
     XsshThemeColors c=xssh_theme_colors(a->settings.theme);
@@ -1018,7 +1049,8 @@ static void render(App *a) {
         wallpaper_draw_region(a,0,lower,WIDTH,HEIGHT-lower,0,lower);
     }
     SDL_SetRenderDrawColor(a->renderer,c.background.r,c.background.g,c.background.b,255);
-    if(a->margin_effects_wallpaper && a->wallpaper_texture && a->wallpaper_opacity>0){
+    if(a->gpu_active && a->cache_valid && a->stage==ST_CONNECTED &&
+       a->margin_effects_wallpaper && a->wallpaper_texture && a->wallpaper_opacity>0){
         SDL_SetTextureAlphaMod(a->wallpaper_texture,(Uint8)(a->wallpaper_opacity*255/100));
         SDL_Rect wallpaper_dest=wallpaper_bounds(a);
         SDL_RenderCopy(a->renderer,a->wallpaper_texture,NULL,&wallpaper_dest);
@@ -2169,6 +2201,7 @@ int main(void) {
     if(a->pad)SDL_GameControllerClose(a->pad);
     if(a->term_cache)SDL_DestroyTexture(a->term_cache);
     if(a->wallpaper_texture)SDL_DestroyTexture(a->wallpaper_texture);
+    free(a->wallpaper_backdrop);
     if(a->font)SDL_DestroyTexture(a->font);
     if(a->font_aa)SDL_DestroyTexture(a->font_aa);
     SDL_DestroyRenderer(a->renderer);
