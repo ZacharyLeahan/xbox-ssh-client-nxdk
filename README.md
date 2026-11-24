@@ -55,9 +55,13 @@ sha256sum bin/default.xbe release/default.xbe
 
 ## Please see xssh.cfg for config options
 
-## Install by dragging all files in release to E:\Apps\XSSH and creating an mp3s folder in that directory
+## Install by dragging all files in release to E:\Apps\XSSH
 
 ## If you are worried about security, please use https://github.com/jws325/Xbox-ssh-client/blob/main/tools/make-seed.py to generate a unique xssh-seed.bin
+
+## 1080i performance is not yet optimized. 
+All other resolutions work ok.\
+480p 4:3 is my preferred resolution and is the most heavily tested.
 
 ## Screenshots
 
