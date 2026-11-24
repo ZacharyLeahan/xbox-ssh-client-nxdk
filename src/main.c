@@ -711,8 +711,20 @@ static void change_font_style(App *a){
     snprintf(a->status,sizeof(a->status),"Font: %s (Ctrl+F to cycle)",
              xssh_font_style_name(a->settings.font_style));
 }
+static void enter(App *a);
 static void startup_action(App *a,int selected){
-    if(selected==0){a->menu_focus=0;a->form.field=XSSH_FORM_HOST;return;}
+    if(selected==0){
+        a->menu_focus=0;
+        for(int field=XSSH_FORM_HOST;field<=XSSH_FORM_PASSWORD;field++){
+            a->form.field=field;
+            if(!xssh_form_validate(&a->form,field)){
+                status(a,xssh_form_field_name(field));
+                return;
+            }
+        }
+        enter(a);
+        return;
+    }
     if(selected==1){a->running=0;return;}
     a->power_action=selected;
     a->stage=ST_POWER_CONFIRM;
@@ -1302,7 +1314,8 @@ static int ssh_auth_complete(App *a) {
     a->ssh_last_keepalive_poll_ms=SDL_GetTicks();
     a->ssh_tx_stall_reported=0;
     term_set_size(&a->term,a->term.cols,a->term.rows);
-    status(a,"Connected - remote shell ready");
+    status(a,xssh_recent_save("D:\\xssh-recent.txt",&a->form)?
+           "Connected - remote shell ready":"Connected - could not save recent connection");
     return 0;
 }
 /* 0 connected, 1 awaiting explicit fingerprint confirmation, -1 failed. */
@@ -1926,6 +1939,7 @@ int main(void) {
     xssh_form_init(&a->form,a->settings.host,a->settings.port,a->settings.user);
     snprintf(a->form.key_file,sizeof(a->form.key_file),"%s",a->settings.key_file);
     a->form.replace_on_type[XSSH_FORM_KEY_FILE]=a->form.key_file[0]!=0;
+    if(xssh_recent_load("D:\\xssh-recent.txt",&a->form))a->menu_focus=1;
     if(!settings_ok){
         status(a,settings_result == -5 ?
                "Invalid LED or screensaver setting in D:\\xssh.cfg" :

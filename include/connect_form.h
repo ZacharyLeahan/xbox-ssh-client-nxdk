@@ -29,6 +29,8 @@ typedef struct {
 
 void xssh_form_init(XsshConnectForm *f, const char *host, int port, const char *user);
 void xssh_form_zero_password(XsshConnectForm *f);
+int xssh_recent_save(const char *path,const XsshConnectForm *f);
+int xssh_recent_load(const char *path,XsshConnectForm *f);
 int xssh_form_type(XsshConnectForm *f, unsigned char c);
 void xssh_form_backspace(XsshConnectForm *f);
 /* Returns 1 if this field is valid and advancing is allowed. */
