@@ -7,6 +7,44 @@ static void copy_field(char *dst, size_t cap, const char *src) {
     if(!src)src="";
     snprintf(dst,cap,"%s",src);
 }
+
+/* Store only editable connection coordinates. Never serialize the form,
+   which also contains the password or private key passphrase. */
+int xssh_recent_save(const char *path,const XsshConnectForm *f) {
+    FILE *out=fopen(path,"wb");
+    if(!out)return 0;
+    int ok=fprintf(out,"%s\n%s\n%s\n%s\n",f->host,f->port,f->user,f->key_file)>0;
+    return fclose(out)==0 && ok;
+}
+
+static int recent_line(FILE *in,char *dst,size_t cap) {
+    size_t n=0;
+    int c;
+    while((c=fgetc(in))!='\n'){
+        if(c<32 || c>126 || n+1>=cap)return 0;
+        dst[n++]=(char)c;
+    }
+    dst[n]=0;
+    return 1;
+}
+
+int xssh_recent_load(const char *path,XsshConnectForm *f) {
+    FILE *in=fopen(path,"rb");
+    if(!in)return 0;
+    XsshConnectForm next={0};
+    int ok=recent_line(in,next.host,sizeof(next.host)) &&
+           recent_line(in,next.port,sizeof(next.port)) &&
+           recent_line(in,next.user,sizeof(next.user)) &&
+           recent_line(in,next.key_file,sizeof(next.key_file)) &&
+           fgetc(in)==EOF && !ferror(in);
+    fclose(in);
+    for(int i=XSSH_FORM_HOST;ok && i<=XSSH_FORM_KEY_FILE;i++){
+        ok=xssh_form_validate(&next,i);
+        next.replace_on_type[i]=1;
+    }
+    if(ok)*f=next;
+    return ok;
+}
 static char *field_ptr(XsshConnectForm *f, int field, size_t *cap) {
     switch(field) {
     case XSSH_FORM_HOST: *cap=sizeof(f->host);return f->host;
