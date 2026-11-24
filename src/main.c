@@ -154,6 +154,7 @@ typedef struct {
     unsigned int ssh_tx_last_delay_ms;
     unsigned int ssh_tx_max_delay_ms;
     unsigned int pad_old;
+    int wait_for_port_one;
     int running;
     int ready;
     int menu_focus; /* 0=form fields, 1=startup actions */
@@ -1790,7 +1791,27 @@ static void usb_key_event(void *ctx,XsshKeyEvent event) {
     }
 }
 static void poll_pad(App*a) {
-    if(!a->pad && SDL_NumJoysticks()>0 && SDL_IsGameController(0))a->pad=SDL_GameControllerOpen(0);
+    if(a->pad && !SDL_GameControllerGetAttached(a->pad)){
+        SDL_GameControllerClose(a->pad);
+        a->pad=NULL;
+        a->pad_old=0;
+    }
+    if(!a->pad){
+        int count=SDL_NumJoysticks();
+        for(int i=0;i<count && !a->pad;i++){
+            if(SDL_IsGameController(i) && SDL_JoystickGetDevicePlayerIndex(i)==1)
+                a->pad=SDL_GameControllerOpen(i);
+        }
+        /* Other ports may remain connected throughout a player-one swap.
+           Keep waiting for port one if it was the terminal's controller. */
+        if(!a->pad && !a->wait_for_port_one){
+            for(int i=0;i<count && !a->pad;i++){
+                if(SDL_IsGameController(i))a->pad=SDL_GameControllerOpen(i);
+            }
+        }
+        if(a->pad)
+            a->wait_for_port_one=SDL_JoystickGetPlayerIndex(SDL_GameControllerGetJoystick(a->pad))==1;
+    }
     if(!a->pad)return;
     const SDL_GameControllerButton buttons[]={
         SDL_CONTROLLER_BUTTON_A,SDL_CONTROLLER_BUTTON_B,
