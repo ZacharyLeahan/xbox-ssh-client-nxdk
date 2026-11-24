@@ -46,7 +46,21 @@ SRCS += $(CURDIR)/src/xssh_audio.c
 SRCS += $(NXAUDIO_ROOT)/audio_core.c $(NXAUDIO_ROOT)/audio_voice.c $(NXAUDIO_ROOT)/audio_buffer.c
 NXDK_CFLAGS += -I$(NXAUDIO_ROOT)/include
 
+SRCS += $(CURDIR)/src/xssh_drums.c
+GPU_ACCELERATION ?= y
+ifeq ($(GPU_ACCELERATION),y)
+PBGL_DIR ?= $(CURDIR)/third_party/pbgl
+SRCS += $(CURDIR)/src/xssh_gpu.c
+NXDK_CFLAGS += -I$(PBGL_DIR)/include
+else
+SRCS += $(CURDIR)/src/xssh_gpu_stub.c
+endif
+
 include $(NXDK_DIR)/Makefile
+ifeq ($(GPU_ACCELERATION),y)
+include $(PBGL_DIR)/config_pbgl.make
+main.exe: $(PBGL_LIB)
+endif
 
 
 # A writable hard-drive release: make (or make release) assembles the three
