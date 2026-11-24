@@ -154,6 +154,7 @@ typedef struct {
     unsigned int ssh_tx_last_delay_ms;
     unsigned int ssh_tx_max_delay_ms;
     unsigned int pad_old;
+    unsigned int pad_repeat_at;
     int wait_for_port_one;
     int running;
     int ready;
@@ -1584,10 +1585,16 @@ static void ssh_pump(App *a) {
 }
 static void nav(App *a,int dx,int dy) {
     a->key_row=(a->key_row+dy+5)%5;
-    if(dx) a->key_col=(a->key_col+dx+14)%14;
     int limit=(a->key_row==0)?12:(a->key_row==1)?13:
               (a->key_row==2)?11:(a->key_row==3)?10:14;
     if(a->key_col>=limit)a->key_col=limit-1;
+    if(dx && a->key_row==4){
+        static const int starts[]={0,3,6,8,10,12};
+        a->key_col=starts[(key_index(a)+dx+6)%6];
+    }else if(dx){
+        a->key_col=(a->key_col+dx+limit)%limit;
+    }
+    a->ui_status_dirty=1;
 }
 static void music_toggle(App *a) {
     char msg[160];
@@ -1823,10 +1830,20 @@ static void poll_pad(App*a) {
     unsigned int now=0;
     for(int i=0;i<10;i++)if(SDL_GameControllerGetButton(a->pad,buttons[i]))now |= (1u<<i);
     unsigned int pressed=now & ~a->pad_old;
+    unsigned int directions=now & (15u<<6);
+    unsigned int ticks=SDL_GetTicks();
+    if(directions!=(a->pad_old & (15u<<6))){
+        a->pad_repeat_at=ticks+350u;
+    }else if(directions && (int32_t)(ticks-a->pad_repeat_at)>=0){
+        /* Repeat navigation only. Slow frames should never cause a burst. */
+        pressed|=directions;
+        a->pad_repeat_at=ticks+100u;
+    }
     a->pad_old=now;
     if(pressed){
         a->last_input_ms=SDL_GetTicks();
         if(a->saver_active){saver_stop(a);return;}
+        a->ui_status_dirty=1;
     }
     /* Do not activate invisible virtual keys while a USB keyboard is present.
        Controller Enter/Backspace/Ctrl-C/disconnect still work. */
