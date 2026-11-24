@@ -99,6 +99,16 @@ static void send_key(XsshHidKeys *s,uint8_t key,uint8_t mods,
     if(ctrl && (key==0x2d || key==0x56)) {
         emit_special(sink,ctx,XSSH_KEY_FONT_DECREASE);return;
     }
+    if(ctrl && shift && key==0x05){emit_special(sink,ctx,XSSH_KEY_WALLPAPER_NEXT);return;}
+    if(ctrl && shift && key==0x10){emit_special(sink,ctx,XSSH_KEY_WALLPAPER_MARGIN);return;}
+    if(ctrl && shift && key==0x12){emit_special(sink,ctx,XSSH_KEY_WALLPAPER_OPACITY);return;}
+    if(ctrl && key==0x2c){emit_special(sink,ctx,XSSH_KEY_DRUM_TOGGLE);return;}
+    if(key>=0x59 && key<=0x62){
+        XsshKeyEvent e={XSSH_KEY_DRUM_PAD,(unsigned char)(key==0x62?0:key-0x58),NULL};
+        sink(ctx,e);return;
+    }
+    if(key==0x57){emit_special(sink,ctx,XSSH_KEY_DRUM_UP);return;}
+    if(key==0x56){emit_special(sink,ctx,XSSH_KEY_DRUM_DOWN);return;}
     if(ctrl && key==0x17) { /* Ctrl+T */
         emit_special(sink,ctx,XSSH_KEY_THEME_TOGGLE);return;
     }
@@ -156,7 +166,7 @@ void xssh_hid_keys_report(XsshHidKeys *s,const uint8_t report[8],
         uint8_t key=report[i];
         if(!key || in_report(s->previous,key))continue;
         send_key(s,key,report[0],sink,ctx);
-        if(key!=0x39 && key!=0x53 && !(report[0]&MOD_CTRL && (key==0x50 || key==0x4f)))next_repeat=key;
+        if(key!=0x39 && key!=0x53 && !(key>=0x59 && key<=0x62) && !(report[0]&MOD_CTRL && (key==0x50 || key==0x4f)))next_repeat=key;
     }
     if(next_repeat) {
         s->repeat_key=next_repeat;
@@ -172,6 +182,6 @@ void xssh_hid_keys_tick(XsshHidKeys *s,uint32_t now_ms,
     if(!s->repeat_key || !in_report(s->previous,s->repeat_key))return;
     if((int32_t)(now_ms-s->repeat_at)>=0) {
         send_key(s,s->repeat_key,s->previous[0],sink,ctx);
-        s->repeat_at=now_ms+REPEAT_INTERVAL;
+        s->repeat_at=now_ms+((s->previous[0]&(MOD_CTRL|MOD_SHIFT))==(MOD_CTRL|MOD_SHIFT) && s->repeat_key==0x12?130u:REPEAT_INTERVAL);
     }
 }

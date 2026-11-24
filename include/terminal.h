@@ -6,8 +6,8 @@
 #define TERM_COLOR_RGB(r,g,b) (0x01000000u | ((uint32_t)(r)<<16) | ((uint32_t)(g)<<8) | (uint32_t)(b))
 #define TERM_COLS 80
 #define TERM_ROWS 24
-#define TERM_MAX_COLS 160
-#define TERM_MAX_ROWS 56
+#define TERM_MAX_COLS 256
+#define TERM_MAX_ROWS 128
 /* Printable bitmap characters are ASCII 32..126; internal glyphs 128+ are
    vector-drawn box strokes by the UI, preserving UTF-8 and VT100 line art. */
 #define TERM_HLINE  128

@@ -186,7 +186,45 @@ def patch_mbedtls_file_io(project: Path):
         print('Already patched:', config)
 
 
+def patch_mbedtls_rsa_publickey_blob(root: Path):
+    """Repair RSA public-key blob length, offsets and positive mpint encoding."""
+    source = root / 'src' / 'mbedtls.c'
+    content = source.read_text()
+    if 'RFC 4253 RSA key blob:' in content:
+        print('Already patched:', source)
+        return
+    start = content.index('static unsigned char *\ngen_publickey_from_rsa(')
+    end = content.index('\nstatic int\n_libssh2_mbedtls_pub_priv_key(', start)
+    original = content[start:end]
+    if '_libssh2_htonu32(p, n_bytes);' not in original:
+        raise RuntimeError(f'{source}: unexpected RSA serialization implementation')
+    replacement = '/* RFC 4253 RSA key blob: string("ssh-rsa"), mpint(e), mpint(n).\n * Positive mpints need a leading 0x00 when their high bit is set. */\nstatic unsigned char *\ngen_publickey_from_rsa(LIBSSH2_SESSION *session,\n                       mbedtls_rsa_context *rsa,\n                       size_t *keylen)\n{\n    const mbedtls_mpi *e = &rsa->MBEDTLS_PRIVATE(E);\n    const mbedtls_mpi *n = &rsa->MBEDTLS_PRIVATE(N);\n    size_t esize = mbedtls_mpi_size(e), nsize = mbedtls_mpi_size(n);\n    size_t epad = (mbedtls_mpi_bitlen(e) % 8 == 0) ? 1 : 0;\n    size_t npad = (mbedtls_mpi_bitlen(n) % 8 == 0) ? 1 : 0;\n    size_t len;\n    unsigned char *key, *p;\n\n    if(!esize || !nsize || esize > 1024 * 1024 || nsize > 1024 * 1024)\n        return NULL;\n    len = 4 + 7 + 4 + esize + epad + 4 + nsize + npad;\n    key = LIBSSH2_ALLOC(session, len);\n    if(!key)\n        return NULL;\n    p = key;\n    _libssh2_htonu32(p, 7);\n    p += 4;\n    memcpy(p, "ssh-rsa", 7);\n    p += 7;\n    _libssh2_htonu32(p, (uint32_t)(esize + epad));\n    p += 4;\n    if(epad)\n        *p++ = 0;\n    if(mbedtls_mpi_write_binary(e, p, esize) != 0)\n        goto fail;\n    p += esize;\n    _libssh2_htonu32(p, (uint32_t)(nsize + npad));\n    p += 4;\n    if(npad)\n        *p++ = 0;\n    if(mbedtls_mpi_write_binary(n, p, nsize) != 0)\n        goto fail;\n    p += nsize;\n    *keylen = (size_t)(p - key);\n    return key;\nfail:\n    LIBSSH2_FREE(session, key);\n    return NULL;\n}\n'
+    source.write_text(content[:start] + replacement + content[end:])
+    print('Patched:', source)
+
+
+def patch_mbedtls_rsa_publickey_result(root: Path):
+    """Fix upstream 1.11.1 uninitialized return code on RSA key extraction."""
+    source = root / 'src' / 'mbedtls.c'
+    content = source.read_text()
+    start = content.index('_libssh2_mbedtls_pub_priv_key(LIBSSH2_SESSION')
+    end = content.index('_libssh2_mbedtls_pub_priv_keyfile(', start)
+    body = content[start:end]
+    old = '    int ret;'
+    new = '    int ret = 0; /* Both allocations succeeding must indicate success. */'
+    if new not in body:
+        if body.count(old) != 1:
+            raise RuntimeError(f'{source}: RSA public-key return-code pattern changed')
+        content = content[:start] + body.replace(old, new, 1) + content[end:]
+        source.write_text(content)
+        print('Patched:', source)
+    else:
+        print('Already patched:', source)
+
+
 def patch(root: Path):
+    patch_mbedtls_rsa_publickey_result(root)
+    patch_mbedtls_rsa_publickey_blob(root)
     patch_chacha_bsd_types(root)
     patch_session_socket_mode(root)
     patch_mbedtls_file_io(root.parent.parent)

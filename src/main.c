@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <ctype.h>
+#include <windows.h>
 #include <SDL.h>
 #include <hal/video.h>
 #include <xboxkrnl/xboxkrnl.h>
@@ -33,23 +34,36 @@
 #include "xssh_led.h"
 #include "xssh_saver.h"
 #include "xssh_mp3.h"
+#include "xssh_drums.h"
+#include "xssh_gpu.h"
 
-#define WIDTH 640
-#define HEIGHT 480
+#define WIDTH g_screen_width
+#define HEIGHT g_screen_height
+static int g_screen_width=640;
+static int g_screen_height=480;
+static int g_output_width=640;
+static int g_output_height=480;
+/* The keyboard and status/footer remain anchored to the screen bottom. */
+#define BOTTOM_OFFSET (HEIGHT-480)
 #define GLYPH_W 8
 #define GLYPH_H 12
 #define SCREEN_Y 24
-#define USB_TERMINAL_HEIGHT 424
-#define PAD_TERMINAL_HEIGHT 288
-#define KEY_Y 342
+#define USB_TERMINAL_HEIGHT (HEIGHT-56)
+#define PAD_TERMINAL_HEIGHT (HEIGHT-192)
+#define KEY_Y (HEIGHT-138)
 #define KEY_W 44
 #define KEY_H 23
 #define KNOWN_HOSTS_FILE "D:\\xssh-known-hosts.txt"
 #define TX_CAP 4096
-#define SSH_READ_BURST_MAX 8
-#define SSH_READ_TIME_BUDGET_MS 4
+#define SSH_READ_BURST_MAX 2
+#define SSH_READ_TIME_BUDGET_MS 2
+#define SSH_KEEPALIVE_INTERVAL_SECONDS 15
+#define SSH_KEEPALIVE_POLL_MS 1000u
+#define SSH_TX_STALL_NOTICE_MS 5000u
+#define SSH_TX_RETRY_INTERVAL_MS 20u /* fallback for libssh2 buffered progress */
 #define CONFIG_FILE "D:\\xssh.cfg"
 #define SAVER_DEFAULT_FILE "D:\\screensaver.xsv"
+#define WALLPAPER_DIR "D:\\wallpapers"
 
 typedef enum { ST_FORM, ST_VERIFY_HOST, ST_CONNECTED, ST_FAILED, ST_POWER_CONFIRM } Stage;
 typedef struct {
@@ -72,10 +86,19 @@ typedef struct {
     int screensaver_enabled;
     int screensaver_seconds;
     char screensaver_file[120];
+    char wallpaper_file[256];
+    int wallpaper_opacity;
+    int wallpaper_margin;
+    int margin_effects_wallpaper;
+    int gpu_acceleration;
 } Settings;
 typedef struct {
     SDL_Window *window;
     SDL_Renderer *renderer;
+    SDL_Surface *gpu_surface;
+    XsshGpu gpu;
+    int gpu_active;
+    int last_cursor_x, last_cursor_y, last_cursor_visible;
     SDL_Texture *font;
     SDL_Texture *font_aa;
     SDL_Texture *term_cache;
@@ -91,6 +114,7 @@ typedef struct {
     int font_resize_pending;
     int last_keyboard_present;
     unsigned int last_render_ms;
+    Stage last_rendered_stage; /* declared after Stage typedef */
     SDL_GameController *pad;
     Terminal term;
     int terminal_glyph_w, terminal_glyph_h;
@@ -106,6 +130,10 @@ typedef struct {
     char status[160];
     char volume_status[40];
     char ram_status[24];
+    char cpu_status[24];
+    uint64_t cpu_busy_ticks;
+    uint64_t cpu_total_ticks;
+    uint64_t cpu_sample_start_ticks;
     unsigned int volume_status_until_ms;
     unsigned int last_ram_poll_ms;
     int ui_status_dirty;
@@ -114,6 +142,17 @@ typedef struct {
     LIBSSH2_CHANNEL *channel;
     unsigned char outgoing[TX_CAP];
     size_t tx_len;
+    unsigned int ssh_last_tx_progress_ms;
+    unsigned int ssh_last_keepalive_poll_ms;
+    int ssh_tx_stall_reported;
+    unsigned int ssh_tx_queued_ms;
+    unsigned int ssh_tx_last_attempt_ms;
+    unsigned int ssh_tx_eagain_count;
+    unsigned int ssh_tx_partial_count;
+    int ssh_tx_waiting;
+    unsigned int ssh_tx_queued_since_ms;
+    unsigned int ssh_tx_last_delay_ms;
+    unsigned int ssh_tx_max_delay_ms;
     unsigned int pad_old;
     int running;
     int ready;
@@ -128,13 +167,26 @@ typedef struct {
     int saver_active;
     XsshSaver saver;
     XsshMp3 music;
+    XsshDrums drums;
+    SDL_Texture *wallpaper_texture;
+    int wallpaper_width,wallpaper_height;
+    char wallpaper_current[256];
+    int wallpaper_opacity;
+    int wallpaper_margin;
+    int margin_effects_wallpaper;
+    int wallpaper_hold;
+    unsigned int wallpaper_next_step;
     SDL_Texture *saver_texture;
     uint32_t *saver_rgba_buffer;
     int saver_rgb565_native;
     int swallow_wake_text;
+    int swallow_drum_text;
 } App;
 
 /* Forward declaration: startup power actions call this before its definition. */
+static void display_margin_clear(App *a);
+static void display_margin_apply(App *a);
+static void resize_for_keyboard(App *a,int force);
 static void disconnect(App *a);
 
 static const char *keyboard[4] = {
@@ -179,11 +231,15 @@ static int load_settings(Settings *s) {
     s->led_valid=1;
     s->screensaver_enabled=1;
     s->screensaver_seconds=120;
+    s->wallpaper_opacity=50;
+    s->wallpaper_margin=0;
+    s->margin_effects_wallpaper=0;
+    s->gpu_acceleration=1;
     snprintf(s->screensaver_file,sizeof(s->screensaver_file),"%s",SAVER_DEFAULT_FILE);
     snprintf(s->video_mode,sizeof(s->video_mode),"auto");
     FILE *f=fopen(CONFIG_FILE,"rb");
-    if(!f)return 0; /* Interactive connection form does not need server defaults. */
-    char line[220];
+    if(!f)goto settings_done; /* Interactive connection form does not need server defaults. */
+    char line[512];
     while(fgets(line,sizeof(line),f)) {
         char *p=trim(line);if(*p=='#'||!*p)continue;
         char *eq=strchr(p,'=');if(!eq)continue;*eq++=0;
@@ -225,8 +281,26 @@ static int load_settings(Settings *s) {
             else s->led_valid=0;
         }
         else if(!strcmp(p,"screensaver_file"))snprintf(s->screensaver_file,sizeof(s->screensaver_file),"%s",eq);
+        else if(!strcmp(p,"wallpaper"))snprintf(s->wallpaper_file,sizeof(s->wallpaper_file),"%s",eq);
+        else if(!strcmp(p,"wallpaper_opacity")){
+            char *end=NULL;long v=strtol(eq,&end,10);
+            if(end!=eq && !*end && v>=0 && v<=100)s->wallpaper_opacity=(int)v;
+        }
+        else if(!strcmp(p,"gpu_acceleration")){
+            if(!strcmp(eq,"true") || !strcmp(eq,"yes") || !strcmp(eq,"1"))s->gpu_acceleration=1;
+            else if(!strcmp(eq,"false") || !strcmp(eq,"no") || !strcmp(eq,"0"))s->gpu_acceleration=0;
+        }
+        else if(!strcmp(p,"margin_effects_wallpaper")){
+            if(!strcmp(eq,"true") || !strcmp(eq,"1"))s->margin_effects_wallpaper=1;
+            else if(!strcmp(eq,"false") || !strcmp(eq,"0"))s->margin_effects_wallpaper=0;
+        }
+        else if(!strcmp(p,"wallpaper_margin")){
+            char *end=NULL;long v=strtol(eq,&end,10);
+            if(end!=eq && !*end && v>=0 && v<=25 && v%5==0)s->wallpaper_margin=(int)v;
+        }
     }
     fclose(f);
+settings_done:
     if(!s->led_valid)return -5;
     if(!s->theme_config_valid)return -3;
     if(!s->font_config_valid)return -4;
@@ -404,15 +478,47 @@ static void render_terminal_glyph(App *a,int px,int py,int w,int h,uint32_t ch,X
     else if(ch>=32&&ch<=126)glyph_scaled(a,px,py,(char)ch,fg,w,h);
     else if(ch>126)unicode_glyph(a,px,py,w,h,ch,fg);
 }
+/* Render the wallpaper only where the requested cell intersects the inset image.
+   The logical wallpaper destination is shared by the full-screen and cached paths. */
+static SDL_Rect wallpaper_bounds(const App *a){
+    if(a->margin_effects_wallpaper)return (SDL_Rect){0,0,WIDTH,HEIGHT};
+    /* Physical full-screen wallpaper, expressed in the inset viewport's
+       unscaled local pixel coordinates. */
+    int mx=g_output_width*a->wallpaper_margin/100;
+    int my=g_output_height*a->wallpaper_margin/100;
+    return (SDL_Rect){-mx,-my,g_output_width,g_output_height};
+}
+static void wallpaper_draw_region(App *a,int screen_x,int screen_y,int width,int height,int target_x,int target_y){
+    if(!a->wallpaper_texture || a->wallpaper_opacity<=0)return;
+    SDL_Rect b=wallpaper_bounds(a);
+    int x0=screen_x>b.x?screen_x:b.x;
+    int y0=screen_y>b.y?screen_y:b.y;
+    int x1=screen_x+width<b.x+b.w?screen_x+width:b.x+b.w;
+    int y1=screen_y+height<b.y+b.h?screen_y+height:b.y+b.h;
+    if(x1<=x0 || y1<=y0)return;
+    SDL_Rect src={
+        (x0-b.x)*a->wallpaper_width/b.w,
+        (y0-b.y)*a->wallpaper_height/b.h,
+        (x1-b.x)*a->wallpaper_width/b.w-(x0-b.x)*a->wallpaper_width/b.w,
+        (y1-b.y)*a->wallpaper_height/b.h-(y0-b.y)*a->wallpaper_height/b.h
+    };
+    SDL_Rect dst={target_x+x0-screen_x,target_y+y0-screen_y,x1-x0,y1-y0};
+    if(src.w<1)src.w=1;
+    if(src.h<1)src.h=1;
+    SDL_SetTextureAlphaMod(a->wallpaper_texture,(Uint8)(a->wallpaper_opacity*255/100));
+    SDL_RenderCopy(a->renderer,a->wallpaper_texture,&src,&dst);
+}
 static void draw_terminal_cell(App *a,int x,int y,XsshThemeColors c){
     int px=x*a->terminal_glyph_w,py=y*a->terminal_glyph_h;
+    int output_y=py+(a->gpu_active?SCREEN_Y:0);
     uint32_t ch=a->term.cells[y][x];
     int rev=a->term.attr[y][x]&1;
     XsshRgb fg=xssh_theme_terminal_color(a->settings.theme,a->term.fg[y][x]);
     XsshRgb bg=xssh_theme_terminal_background(a->settings.theme,a->term.bg[y][x]);
     if(rev){XsshRgb tmp=fg;fg=bg;bg=tmp;}
-    rect(a,px,py,a->terminal_glyph_w,a->terminal_glyph_h,bg);
-    if(ch!=' ')render_terminal_glyph(a,px,py,a->terminal_glyph_w,a->terminal_glyph_h,ch,fg);
+    rect(a,px,output_y,a->terminal_glyph_w,a->terminal_glyph_h,bg);
+    wallpaper_draw_region(a,px,py+SCREEN_Y,a->terminal_glyph_w,a->terminal_glyph_h,px,output_y);
+    if(ch!=' ')render_terminal_glyph(a,px,output_y,a->terminal_glyph_w,a->terminal_glyph_h,ch,fg);
 }
 /* Bounds the amount of glyph work in each frame. A continuously updating
    terminal (cmatrix/btop) must not monopolize the Xbox on screensaver exit. */
@@ -421,6 +527,66 @@ static void draw_terminal_cell(App *a,int x,int y,XsshThemeColors c){
 /* Render into an SDL target texture only when cells change. If the nxdk SDL2
    backend cannot target textures, draw directly as a compatibility fallback. */
 static void draw_terminal(App *a,XsshThemeColors c){
+    if(a->gpu_active){
+        /* GPU presentation mode: SDL writes bitmap glyphs directly into a
+           persistent, native-resolution CPU surface. Repaint only cells that
+           changed; the NV2A GPU then blits only changed surface tiles. */
+        if(!a->cache_valid){
+            for(int y=0;y<a->term.rows;y++)for(int x=0;x<a->term.cols;x++)
+                a->cached_cells[y][x]=UINT32_MAX;
+            a->cache_valid=1;
+            a->cache_scan_cursor=0;
+            a->cache_scan_active=1;
+            a->cache_scan_again=0;
+            a->last_cursor_visible=0;
+        }
+        if(a->term.dirty){
+            if(a->cache_scan_active)a->cache_scan_again=1;
+            else {a->cache_scan_cursor=0;a->cache_scan_active=1;}
+            a->term.dirty=0;
+        }
+        if(a->cache_scan_active){
+            unsigned total=(unsigned)a->term.cols*(unsigned)a->term.rows;
+            unsigned budget=xssh_mp3_is_playing(&a->music)?
+                TERMINAL_REDRAW_BUDGET_MUSIC:TERMINAL_REDRAW_BUDGET;
+            unsigned end=a->cache_scan_cursor+budget;
+            if(end>total)end=total;
+            for(unsigned i=a->cache_scan_cursor;i<end;i++){
+                int y=(int)(i/(unsigned)a->term.cols);
+                int x=(int)(i%(unsigned)a->term.cols);
+                uint32_t ch=a->term.cells[y][x],fg=a->term.fg[y][x],bg=a->term.bg[y][x];
+                unsigned char attr=a->term.attr[y][x];
+                if(a->cached_cells[y][x]!=ch || a->cached_fg[y][x]!=fg ||
+                   a->cached_bg[y][x]!=bg || a->cached_attrs[y][x]!=attr){
+                    draw_terminal_cell(a,x,y,c);
+                    a->cached_cells[y][x]=ch;a->cached_fg[y][x]=fg;
+                    a->cached_bg[y][x]=bg;a->cached_attrs[y][x]=attr;
+                }
+            }
+            a->cache_scan_cursor=end;
+            if(end==total){
+                a->cache_scan_cursor=0;
+                if(a->cache_scan_again)a->cache_scan_again=0;
+                else a->cache_scan_active=0;
+            }
+        }
+        /* Erase the previous cursor before moving it, even if no cell data
+           changed. This avoids leaving a permanent underscore behind. */
+        if(a->last_cursor_visible && a->last_cursor_x>=0 && a->last_cursor_y>=0 &&
+           a->last_cursor_x<a->term.cols && a->last_cursor_y<a->term.rows)
+            draw_terminal_cell(a,a->last_cursor_x,a->last_cursor_y,c);
+        a->last_cursor_visible=0;
+        if(a->term.cursor_visible && a->term.x<a->term.cols && a->term.y<a->term.rows){
+            int h=a->terminal_glyph_h>=12?2:1;
+            rect(a,a->term.x*a->terminal_glyph_w,
+                SCREEN_Y+(a->term.y+1)*a->terminal_glyph_h-h,
+                a->terminal_glyph_w,h,c.foreground);
+            a->last_cursor_visible=1;
+            a->last_cursor_x=a->term.x;
+            a->last_cursor_y=a->term.y;
+        }
+        return;
+    }
     int cache_ready=a->term_cache!=NULL;
     if(cache_ready && SDL_SetRenderTarget(a->renderer,a->term_cache)!=0){
         SDL_DestroyTexture(a->term_cache);a->term_cache=NULL;
@@ -428,6 +594,9 @@ static void draw_terminal(App *a,XsshThemeColors c){
         a->cache_scan_active=0;a->cache_scan_again=0;
     }
     if(cache_ready){
+        /* Render-target textures must use their own full, unscaled viewport. */
+        SDL_RenderSetScale(a->renderer,1.0f,1.0f);
+        SDL_RenderSetViewport(a->renderer,NULL);
         if(!a->cache_valid){
             /* A real atlas/font/layout change requires a rebuild, unlike
                screensaver dismissal which leaves the cache intact. */
@@ -475,6 +644,7 @@ static void draw_terminal(App *a,XsshThemeColors c){
             }
         }
         SDL_SetRenderTarget(a->renderer,NULL);
+        display_margin_apply(a);
         SDL_Rect from={0,0,WIDTH,a->term_height},to={0,SCREEN_Y,WIDTH,a->term_height};
         SDL_RenderCopy(a->renderer,a->term_cache,&from,&to);
     } else {
@@ -487,6 +657,7 @@ static void draw_terminal(App *a,XsshThemeColors c){
             XsshRgb bg=xssh_theme_terminal_background(a->settings.theme,a->term.bg[y][x]);
             if(rev){XsshRgb tmp=fg;fg=bg;bg=tmp;}
             rect(a,px,py,a->terminal_glyph_w,a->terminal_glyph_h,bg);
+            wallpaper_draw_region(a,px,py,a->terminal_glyph_w,a->terminal_glyph_h,px,py);
             if(ch!=' ')render_terminal_glyph(a,px,py,a->terminal_glyph_w,a->terminal_glyph_h,ch,fg);
         }
         a->term.dirty=0;
@@ -502,7 +673,7 @@ static void resize_for_keyboard(App *a,int force){
     if(!force && !a->font_resize_pending && now==a->last_keyboard_present)return;
     int width,rows;
     a->term_height=now?USB_TERMINAL_HEIGHT:PAD_TERMINAL_HEIGHT;
-    xssh_font_layout_for_height(a->settings.font_size,a->term_height,&a->terminal_glyph_w,&a->terminal_glyph_h,&width,&rows);
+    xssh_font_layout_for_area(a->settings.font_size,WIDTH,a->term_height,&a->terminal_glyph_w,&a->terminal_glyph_h,&width,&rows);
     if(a->term.cols==width&&a->term.rows==rows){
         a->last_keyboard_present=now;
         a->font_resize_pending=0;
@@ -575,6 +746,8 @@ static void confirm_power(App *a,int yes){
     if(a->font_aa){SDL_DestroyTexture(a->font_aa);a->font_aa=NULL;}
     if(a->pad){SDL_GameControllerClose(a->pad);a->pad=NULL;}
     if(a->renderer){SDL_DestroyRenderer(a->renderer);a->renderer=NULL;}
+    if(a->gpu_active){xssh_gpu_shutdown(&a->gpu);a->gpu_active=0;}
+    if(a->gpu_surface){SDL_FreeSurface(a->gpu_surface);a->gpu_surface=NULL;}
     if(a->window){SDL_DestroyWindow(a->window);a->window=NULL;}
     xssh_led_restore();
     SDL_Quit();
@@ -600,6 +773,10 @@ static void saver_stop(App *a){
        only covered it, it did not invalidate it. A dirty pass will reconcile
        the latest cmatrix/vim output incrementally after wake. */
     a->term.dirty=1;
+    /* GPU mode draws directly onto the persistent CPU surface. Screensaver
+       frames have overwritten those pixels, so the terminal needs rebuilding.
+       The original SDL render-target cache is unaffected. */
+    if(a->gpu_active)a->cache_valid=0;
     a->last_render_ms=0;
     update_front_led(a);
 }
@@ -633,6 +810,9 @@ static void saver_start(App *a,unsigned int now){
 static void saver_draw(App *a,unsigned int now){
     if(!a->saver_active)return;
     uint32_t frame=((uint32_t)(now-a->saver_start_ms)*a->saver.fps/1000u)%a->saver.frames;
+    /* The GPU retains the previous screensaver image. Do not re-upload an
+       identical frame when the render loop polls faster than its FPS. */
+    if(a->gpu_active && frame==a->saver_last_frame)return;
     if(frame!=a->saver_last_frame){
         if(!xssh_saver_frame(&a->saver,frame)){saver_stop(a);return;}
         const void *pixels=a->saver.pixels;
@@ -647,19 +827,200 @@ static void saver_draw(App *a,unsigned int now){
             pixels=a->saver_rgba_buffer;
             pitch=(int)a->saver.width*4;
         }
-        if(SDL_UpdateTexture(a->saver_texture,NULL,pixels,pitch)!=0){saver_stop(a);return;}
+        if(!a->gpu_active && SDL_UpdateTexture(a->saver_texture,NULL,pixels,pitch)!=0){
+            saver_stop(a);return;
+        }
         a->saver_last_frame=frame;
     }
-    SDL_SetRenderDrawColor(a->renderer,0,0,0,255);
-    SDL_RenderClear(a->renderer);
+    if(a->gpu_active && xssh_gpu_present_saver(&a->gpu,a->saver.pixels,
+             (int)a->saver.width,(int)a->saver.height,a->wallpaper_margin))return;
+    if(a->gpu_active){
+        const void *fallback_pixels=a->saver_rgb565_native ?
+            (const void*)a->saver.pixels:(const void*)a->saver_rgba_buffer;
+        int fallback_pitch=(int)a->saver.width*(a->saver_rgb565_native?2:4);
+        if(SDL_UpdateTexture(a->saver_texture,NULL,fallback_pixels,fallback_pitch)!=0){
+            saver_stop(a);return;
+        }
+    }
+    display_margin_clear(a);
     SDL_Rect dest={0,0,WIDTH,HEIGHT};
     SDL_RenderCopy(a->renderer,a->saver_texture,NULL,&dest);
-    SDL_RenderPresent(a->renderer);
+    if(a->gpu_active){
+        /* Flush SDL's software command queue before NV2A reads the pixels. */
+        SDL_RenderPresent(a->renderer);
+        xssh_gpu_present(&a->gpu,a->gpu_surface);
+    }else SDL_RenderPresent(a->renderer);
+}
+/* Strict 32-bit uncompressed BMP with X8R8G8B8 pixels (little-endian
+   B,G,R,unused).  24-bit, alpha-bearing, compressed and other files rejected. */
+static unsigned int wall_le16(const unsigned char *b){return (unsigned)b[0]|((unsigned)b[1]<<8);}
+static unsigned int wall_le32(const unsigned char *b){return wall_le16(b)|(wall_le16(b+2)<<16);}
+static int wallpaper_load(App *a,const char *path){
+    FILE *f=fopen(path,"rb");if(!f)return 0;
+    unsigned char h[54];
+    if(fread(h,1,sizeof(h),f)!=sizeof(h)){fclose(f);return 0;}
+    unsigned int offset=wall_le32(h+10),dib=wall_le32(h+14);
+    int w=(int)wall_le32(h+18),signed_h=(int)wall_le32(h+22);
+    if(h[0]!='B'||h[1]!='M'||dib!=40||offset<54||offset>4096||
+       w<1||w>1024||signed_h==0||signed_h==INT32_MIN||
+       signed_h>768||signed_h< -768||wall_le16(h+26)!=1||
+       wall_le16(h+28)!=32||wall_le32(h+30)!=0){fclose(f);return 0;}
+    int height=signed_h<0?-signed_h:signed_h;
+    size_t bytes=(size_t)w*(size_t)height*4;
+    if(fseek(f,0,SEEK_END)!=0 || ftell(f)<(long)(offset+bytes) ||
+       fseek(f,(long)offset,SEEK_SET)!=0){fclose(f);return 0;}
+    uint32_t *pixels=(uint32_t*)malloc(bytes);
+    if(!pixels){fclose(f);return 0;}
+    /* Read a row at a time; convert to SDL RGBA8888 with opaque alpha. */
+    for(int y=0;y<height;y++){
+        int dst_y=signed_h>0?height-1-y:y;
+        uint32_t *row=pixels+(size_t)dst_y*w;
+        for(int x=0;x<w;x++){
+            unsigned char b[4];
+            if(fread(b,1,4,f)!=4){free(pixels);fclose(f);return 0;}
+            /* X8R8G8B8 requires unused high byte to be zero. */
+            if(b[3]!=0){free(pixels);fclose(f);return 0;}
+            row[x]=((uint32_t)b[2]<<24)|((uint32_t)b[1]<<16)|((uint32_t)b[0]<<8)|255u;
+        }
+    }
+    fclose(f);
+    SDL_Texture *texture=SDL_CreateTexture(a->renderer,SDL_PIXELFORMAT_RGBA8888,
+                                            SDL_TEXTUREACCESS_STATIC,w,height);
+    if(!texture){free(pixels);return 0;}
+    if(SDL_UpdateTexture(texture,NULL,pixels,w*4)!=0){SDL_DestroyTexture(texture);free(pixels);return 0;}
+    free(pixels);
+    SDL_SetTextureBlendMode(texture,SDL_BLENDMODE_BLEND);
+    if(a->wallpaper_texture)SDL_DestroyTexture(a->wallpaper_texture);
+    a->wallpaper_texture=texture;
+    a->wallpaper_width=w;a->wallpaper_height=height;
+    a->cache_valid=0;
+    snprintf(a->wallpaper_current,sizeof(a->wallpaper_current),"%s",path);
+    a->last_render_ms=0;
+    return 1;
+}
+static int wallpaper_candidate(const char *name){
+    size_t n=strlen(name);
+    if(n<5||n>160||name[0]=='.'||strchr(name,'\\')||strchr(name,'/'))return 0;
+    const char *ext=name+n-4;
+    return (ext[0]=='.' && (ext[1]=='b'||ext[1]=='B') &&
+            (ext[2]=='m'||ext[2]=='M') && (ext[3]=='p'||ext[3]=='P'));
+}
+static void wallpaper_next(App *a){
+    WIN32_FIND_DATAA fd;
+    HANDLE h=FindFirstFileA(WALLPAPER_DIR "\\*",&fd);
+    if(h==INVALID_HANDLE_VALUE)return;
+    char next[180]={0},first[180]={0};
+    const char *current=strrchr(a->wallpaper_current,'\\');
+    current=current?current+1:a->wallpaper_current;
+    do{
+        const char *name=fd.cFileName;
+        if((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)||!wallpaper_candidate(name))continue;
+        if(!first[0]||strcmp(name,first)<0)snprintf(first,sizeof(first),"%s",name);
+        if(strcmp(name,current)>0 && (!next[0]||strcmp(name,next)<0))
+            snprintf(next,sizeof(next),"%s",name);
+    }while(FindNextFileA(h,&fd));
+    FindClose(h);
+    if(!next[0])snprintf(next,sizeof(next),"%s",first);
+    if(!next[0])return;
+    /* Invalid files are never used; scan other candidates in sorted order. */
+    char attempted[180]={0};
+    for(int i=0;i<256;i++){
+        char path[256];snprintf(path,sizeof(path),"%s\\%s",WALLPAPER_DIR,next);
+        if(wallpaper_load(a,path))return;
+        snprintf(attempted,sizeof(attempted),"%s",next);
+        h=FindFirstFileA(WALLPAPER_DIR "\\*",&fd);
+        if(h==INVALID_HANDLE_VALUE)return;
+        char higher[180]={0},lowest[180]={0};
+        do{
+            const char *name=fd.cFileName;
+            if((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)||!wallpaper_candidate(name))continue;
+            if(!lowest[0]||strcmp(name,lowest)<0)snprintf(lowest,sizeof(lowest),"%s",name);
+            if(strcmp(name,attempted)>0&&(!higher[0]||strcmp(name,higher)<0))
+                snprintf(higher,sizeof(higher),"%s",name);
+        }while(FindNextFileA(h,&fd));
+        FindClose(h);
+        snprintf(next,sizeof(next),"%s",higher[0]?higher:lowest);
+        if(!next[0]||strcmp(next,attempted)==0)break;
+    }
+}
+static void wallpaper_step(App *a){
+    a->wallpaper_opacity=(a->wallpaper_opacity+1)%101;
+    /* Show the current level on the bottom status bar on every step,
+       including the gradual updates while Ctrl+Shift+O is held. */
+    char msg[64];
+    snprintf(msg,sizeof(msg),"Wallpaper opacity: %d%%",a->wallpaper_opacity);
+    status_bar_only(a,msg);
+    a->cache_valid=0;
+    a->last_render_ms=0;
+}
+static void wallpaper_margin_step(App *a){
+    a->wallpaper_margin=(a->wallpaper_margin+5)%30;
+    /* Inset the UI at native pixel size; never resample bitmap glyphs. */
+    g_screen_width=g_output_width-2*(g_output_width*a->wallpaper_margin/100);
+    g_screen_height=g_output_height-2*(g_output_height*a->wallpaper_margin/100);
+    a->font_resize_pending=1;
+    resize_for_keyboard(a,1);
+    char msg[64];
+    snprintf(msg,sizeof(msg),"Wallpaper margin: %d%%",a->wallpaper_margin);
+    status_bar_only(a,msg);
+    a->cache_valid=0;
+    a->last_render_ms=0;
+}
+/* The margin is a physical-pixel inset, NOT a fractional scaling transform.
+   Text is drawn at 1:1 native pixel size to avoid blurry/uneven bitmap glyphs. */
+static void display_margin_apply(App *a){
+    int mx=g_output_width*a->wallpaper_margin/100;
+    int my=g_output_height*a->wallpaper_margin/100;
+    SDL_Rect viewport={mx,my,WIDTH,HEIGHT};
+    SDL_RenderSetScale(a->renderer,1.0f,1.0f);
+    SDL_RenderSetViewport(a->renderer,&viewport);
+}
+static void display_margin_clear(App *a){
+    SDL_RenderSetScale(a->renderer,1.0f,1.0f);
+    SDL_RenderSetViewport(a->renderer,NULL);
+    SDL_SetRenderDrawColor(a->renderer,0,0,0,255);
+    SDL_RenderClear(a->renderer);
+    if(!a->margin_effects_wallpaper && a->wallpaper_texture && a->wallpaper_opacity>0){
+        SDL_Rect full={0,0,g_output_width,g_output_height};
+        SDL_SetTextureAlphaMod(a->wallpaper_texture,(Uint8)(a->wallpaper_opacity*255/100));
+        SDL_RenderCopy(a->renderer,a->wallpaper_texture,NULL,&full);
+    }
+    display_margin_apply(a);
 }
 static void render(App *a) {
     XsshThemeColors c=xssh_theme_colors(a->settings.theme);
+    /* A stage change invalidates the *whole* display, not just the terminal
+       cells. In GPU mode the SDL surface persists across sessions, so a
+       cached-cell-only repaint otherwise leaves login controls underneath
+       transparent/undrawn parts of the new shell (and vice versa). */
+    int stage_changed=a->last_rendered_stage!=a->stage;
+    if(stage_changed){
+        a->cache_valid=0;
+        a->cache_scan_active=0;
+        a->cache_scan_again=0;
+        a->cache_scan_cursor=0;
+        a->last_cursor_visible=0;
+        a->term.dirty=1;
+    }
+    if(!a->gpu_active || !a->cache_valid || a->stage!=ST_CONNECTED){
+        display_margin_clear(a);
+    }else{
+        /* Preserve unchanged CPU terminal pixels between redraws. */
+        display_margin_apply(a);
+        rect(a,0,0,WIDTH,SCREEN_Y,c.background);
+        wallpaper_draw_region(a,0,0,WIDTH,SCREEN_Y,0,0);
+        /* The footer/status contains dynamic text of changing lengths. */
+        int lower=a->last_keyboard_present?HEIGHT-32:HEIGHT-155;
+        if(lower<0)lower=0;
+        rect(a,0,lower,WIDTH,HEIGHT-lower,c.background);
+        wallpaper_draw_region(a,0,lower,WIDTH,HEIGHT-lower,0,lower);
+    }
     SDL_SetRenderDrawColor(a->renderer,c.background.r,c.background.g,c.background.b,255);
-    SDL_RenderClear(a->renderer);
+    if(a->margin_effects_wallpaper && a->wallpaper_texture && a->wallpaper_opacity>0){
+        SDL_SetTextureAlphaMod(a->wallpaper_texture,(Uint8)(a->wallpaper_opacity*255/100));
+        SDL_Rect wallpaper_dest=wallpaper_bounds(a);
+        SDL_RenderCopy(a->renderer,a->wallpaper_texture,NULL,&wallpaper_dest);
+    }
     text_at(a,8,6,XSSH_UI_LABEL,c.foreground,25);
     {char video_font[48];
      snprintf(video_font,sizeof(video_font),"%s F%d %s AA:%s",a->video.description,a->settings.font_size,
@@ -686,9 +1047,14 @@ static void render(App *a) {
         text_at(a,14,215,"X / Esc = CANCEL (no authentication sent)",c.foreground,76);
         text_at(a,14,246,"Trusted keys saved as D:\\xssh-known-hosts.txt",c.foreground,76);
     } else {
-        text_at(a,14,47,"CONNECT TO SSH SERVER",c.foreground,60);
+        int compact=HEIGHT<460;
+        int form_top=compact?45:77;
+        int form_step=compact?(HEIGHT<330?22:27):34;
+        int form_row_h=compact?(form_step-2):26;
+        int actions_y=compact?(form_top+5*form_step+7):270;
+        text_at(a,14,compact?30:47,"CONNECT TO SSH SERVER",c.foreground,60);
         /* Release identifier is visible before any network login. */
-        text_at(a,387,47,XSSH_BUILD_ID,c.foreground,30);
+        if(WIDTH>=700)text_at(a,WIDTH-260,compact?30:47,XSSH_BUILD_ID,c.foreground,30);
         for(int field=0;field<XSSH_FORM_COUNT;field++) {
             const char *value=(field==XSSH_FORM_HOST)?a->form.host:
                               (field==XSSH_FORM_PORT)?a->form.port:
@@ -699,46 +1065,58 @@ static void render(App *a) {
                 size_t n=strlen(value);if(n>sizeof(display)-1)n=sizeof(display)-1;
                 memset(display,'*',n);display[n]=0;
             }else snprintf(display,sizeof(display),"%s",value);
-            int y=77+field*34;
+            int y=form_top+field*form_step;
             const char *label=(field==XSSH_FORM_PASSWORD && a->form.key_file[0])?
                               "PASSPHRASE":xssh_form_field_name(field);
             if(a->stage==ST_FORM && a->form.field==field) {
-                rect(a,8,y-5,624,26,c.foreground);
+                rect(a,8,y-5,WIDTH-16,form_row_h,c.foreground);
                 text_at(a,14,y,label,c.background,12);
                 text_at(a,150,y,display,c.background,58);
                 int cursor_x=150+(int)strlen(display)*8;
                 if(cursor_x<615)rect(a,cursor_x,y+11,7,2,c.background);
             } else {
-                outline(a,8,y-5,624,26,c.foreground);
+                outline(a,8,y-5,WIDTH-16,form_row_h,c.foreground);
                 text_at(a,14,y,label,c.foreground,12);
                 text_at(a,150,y,display,c.foreground,58);
             }
         }
         const char *actions[]={"CONNECT","EXIT","RESTART","SHUTDOWN"};
         for(int i=0;i<4;i++){
-            int x=14+i*156,y=270;
+            int x=14+i*((WIDTH-28)/4),y=actions_y;
             int selected=(a->menu_focus && a->menu_action==i);
-            if(selected)rect(a,x,y,144,25,c.foreground);
-            else outline(a,x,y,144,25,c.foreground);
+            if(selected)rect(a,x,y,(WIDTH-28)/4-8,25,c.foreground);
+            else outline(a,x,y,(WIDTH-28)/4-8,25,c.foreground);
             text_at(a,x+12,y+7,actions[i],selected?c.background:c.foreground,18);
         }
-        text_at(a,14,302,"TAB: MENU / F9: EXIT  F10: RESTART  F11: OFF",c.foreground,74);
+        if(actions_y+58<HEIGHT-42)
+            text_at(a,14,actions_y+32,"TAB: MENU / F9: EXIT  F10: RESTART  F11: OFF",c.foreground,74);
     }
-    int usb_terminal=(a->stage==ST_CONNECTED && a->last_keyboard_present);
-    rect(a,0,usb_terminal?450:326,WIDTH,1,c.foreground);
-    /* Show volume briefly after an adjustment; otherwise show live RAM use. */
+    /* On the login form with a USB keyboard, use the short bottom status
+       layout. The old 154px footer placed status across the action buttons
+       at 480p when display margins reduced the viewport height. */
+    int usb_terminal=a->last_keyboard_present &&
+                     (a->stage==ST_CONNECTED || a->stage==ST_FORM);
+    rect(a,0,usb_terminal?(HEIGHT-30):(HEIGHT-154),WIDTH,1,c.foreground);
+    if(a->drums.enabled && !(a->volume_status[0] &&
+        (int32_t)(a->volume_status_until_ms-SDL_GetTicks())>0)){
+        snprintf(a->volume_status,sizeof(a->volume_status),"DRUM ON %d%%",a->drums.volume);
+        a->volume_status_until_ms=SDL_GetTicks()+1500u;
+    }
+    /* Keep CPU and RAM visible together; volume temporarily replaces RAM. */
     const char *right_status =
         (a->volume_status[0] &&
          (int32_t)(a->volume_status_until_ms-SDL_GetTicks())>0)
         ? a->volume_status : a->ram_status;
-    text_at(a,4,usb_terminal?451:329,a->status,c.foreground,
-            right_status[0]?58:78);
-    if(right_status[0]){
-        int len=(int)strlen(right_status);
-        if(len>19)len=19;
-        text_at(a,WIDTH-4-len*8,usb_terminal?451:329,
-                right_status,c.foreground,len);
-    }
+    char meters[64];
+    if(right_status[0])
+        snprintf(meters,sizeof(meters),"%s  %s",a->cpu_status,right_status);
+    else snprintf(meters,sizeof(meters),"%s",a->cpu_status);
+    int meter_len=(int)strlen(meters);
+    if(meter_len>25)meter_len=25;
+    int meter_x=WIDTH-4-meter_len*8;
+    text_at(a,4,usb_terminal?(HEIGHT-29):(HEIGHT-151),a->status,c.foreground,
+            meter_x>8?(meter_x-8)/8:0);
+    text_at(a,meter_x,usb_terminal?(HEIGHT-29):(HEIGHT-151),meters,c.foreground,meter_len);
     /* USB keyboard auto-hide remains unchanged in both themes. */
     if(xssh_software_keyboard_visible()) {
         for(int row=0;row<5;row++){
@@ -767,7 +1145,7 @@ static void render(App *a) {
                 }
             }
         }
-    } else if(a->stage!=ST_CONNECTED) {
+    } else if(a->stage!=ST_CONNECTED && HEIGHT>=510) {
         text_at(a,12,353,"USB KEYBOARD CONNECTED",c.foreground,52);
         text_at(a,12,379,"Type using your USB keyboard.",c.foreground,55);
         text_at(a,12,402,"Unplug to restore the controller keyboard.",c.foreground,55);
@@ -778,8 +1156,13 @@ static void render(App *a) {
               xssh_usb_keyboard_connected() ? "USB KB READY" : "USB KB NOT FOUND",
               xssh_software_keyboard_visible() ?
                   "D-PAD/A TYPE B ENTER X BACK" : "USB TYPE B ENTER X BACK");
-     text_at(a,4,463,footer,c.foreground,79);}
-    SDL_RenderPresent(a->renderer);
+     text_at(a,4,HEIGHT-17,footer,c.foreground,79);}
+    if(a->gpu_active){
+        /* Flush SDL's software command queue before NV2A reads the pixels. */
+        SDL_RenderPresent(a->renderer);
+        xssh_gpu_present(&a->gpu,a->gpu_surface);
+    }else SDL_RenderPresent(a->renderer);
+    a->last_rendered_stage=a->stage;
 }
 
 static void disconnect(App *a) {
@@ -791,6 +1174,9 @@ static void disconnect(App *a) {
     if(a->sock>=0){close(a->sock);a->sock=-1;}
     if(a->session){libssh2_session_free(a->session);a->session=NULL;}
     a->tx_len=0;
+    a->ssh_tx_stall_reported=0;
+    a->ssh_last_tx_progress_ms=0;
+    a->ssh_last_keepalive_poll_ms=0;
 }
 static int pin_is_valid(const char *pin) {
     if(strlen(pin)!=64)return 0;
@@ -909,6 +1295,12 @@ static int ssh_auth_complete(App *a) {
          status(a,"Cannot enable nonblocking socket");return -1;
      }}
     libssh2_session_set_blocking(a->session,0);
+    /* Keep idle sessions alive through wireless extenders and NAT devices.
+       Nonblocking sessions must explicitly service keepalives in ssh_pump. */
+    libssh2_keepalive_config(a->session,1,SSH_KEEPALIVE_INTERVAL_SECONDS);
+    a->ssh_last_tx_progress_ms=SDL_GetTicks();
+    a->ssh_last_keepalive_poll_ms=SDL_GetTicks();
+    a->ssh_tx_stall_reported=0;
     term_set_size(&a->term,a->term.cols,a->term.rows);
     status(a,"Connected - remote shell ready");
     return 0;
@@ -935,6 +1327,9 @@ static int ssh_connect(App *a) {
     /* Disable Nagle: Vim and other full-screen apps need single-keystroke
        SSH packets to be sent promptly, even with pending small packets. */
     {int one=1;
+     /* TCP keepalive complements SSH keepalives; leave platform defaults
+        for probe timing because not all nxdk/lwIP builds expose TCP_KEEP*. */
+     (void)setsockopt(a->sock,SOL_SOCKET,SO_KEEPALIVE,&one,sizeof(one));
      if(setsockopt(a->sock,IPPROTO_TCP,TCP_NODELAY,&one,sizeof(one))!=0)
          status(a,"Warning: TCP_NODELAY unavailable; input may lag");}
     if(connect(a->sock,(struct sockaddr*)&addr,sizeof(addr))<0){status(a,"TCP connection failed");goto out;}
@@ -996,6 +1391,8 @@ static void trust_host_and_authenticate(App *a) {
         disconnect(a);
     } else if(ssh_auth_complete(a)==0) {
         a->stage=ST_CONNECTED;
+        a->cache_valid=0;
+        a->last_render_ms=0;
     } else {
         a->stage=ST_FAILED;
         disconnect(a);
@@ -1003,9 +1400,16 @@ static void trust_host_and_authenticate(App *a) {
     xssh_form_zero_password(&a->form);
     memset(a->pending_hostkey,0,sizeof(a->pending_hostkey));
 }
+static void ssh_flush_outgoing(App *a);
 static void enqueue(App *a,const unsigned char *data,size_t n) {
     if(a->stage!=ST_CONNECTED||n==0)return;
     if(n>TX_CAP-a->tx_len){status(a,"Outgoing buffer full");return;}
+    if(a->tx_len==0){
+        a->ssh_last_tx_progress_ms=SDL_GetTicks();
+        a->ssh_tx_queued_ms=a->ssh_last_tx_progress_ms;
+        a->ssh_tx_stall_reported=0;
+        a->ssh_tx_queued_since_ms=a->ssh_last_tx_progress_ms;
+    }
     memcpy(a->outgoing+a->tx_len,data,n);a->tx_len+=n;
 }
 static void type_byte(App *a,unsigned char c) {
@@ -1044,8 +1448,11 @@ static void enter(App*a) {
             status(a,"No Xbox IP address yet; check Ethernet/DHCP");return;
         }
         int r=ssh_connect(a);
-        if(r==0)a->stage=ST_CONNECTED;
-        else if(r<0)a->stage=ST_FAILED;
+        if(r==0){
+            a->stage=ST_CONNECTED;
+            a->cache_valid=0;
+            a->last_render_ms=0;
+        } else if(r<0)a->stage=ST_FAILED;
         /* r==1: first-use host fingerprint displayed for confirmation. */
     } else if(a->stage==ST_FAILED) {
         a->stage=ST_FORM;
@@ -1074,13 +1481,46 @@ static void virtual_key(App *a) {
 /* Never let a busy program's stdout starve interactive keyboard input.
    This function is always called before the read burst and once afterward.
    It never blocks: libssh2's session and socket are both nonblocking. */
+/* Retry a blocked write only when socket readiness changes, or periodically
+   as a fallback for buffered libssh2 protocol work. No blocking wait. */
+static int ssh_tx_can_retry(App *a,unsigned int now) {
+    if(!a->ssh_tx_waiting)return 1;
+    if((unsigned)(now-a->ssh_tx_last_attempt_ms)>=SSH_TX_RETRY_INTERVAL_MS)return 1;
+    if(a->sock<0)return 0;
+    fd_set rd,wr;
+    struct timeval tv={0,0};
+    int directions=libssh2_session_block_directions(a->session);
+    FD_ZERO(&rd);FD_ZERO(&wr);
+    if(directions&LIBSSH2_SESSION_BLOCK_INBOUND)FD_SET(a->sock,&rd);
+    if(directions&LIBSSH2_SESSION_BLOCK_OUTBOUND)FD_SET(a->sock,&wr);
+    if(!directions)return 1;
+    return select(a->sock+1,&rd,&wr,NULL,&tv)>0;
+}
 static void ssh_flush_outgoing(App *a) {
     if(a->stage!=ST_CONNECTED || !a->channel || !a->tx_len)return;
+    unsigned int now=SDL_GetTicks();
+    if(!ssh_tx_can_retry(a,now))return;
+    a->ssh_tx_last_attempt_ms=now;
     ssize_t n=libssh2_channel_write(a->channel,(const char*)a->outgoing,a->tx_len);
     if(n>0){
+        if((size_t)n<a->tx_len)a->ssh_tx_partial_count++;
+        a->ssh_tx_waiting=0;
+        a->ssh_last_tx_progress_ms=SDL_GetTicks();
+        if(a->ssh_tx_stall_reported){
+            char msg[160];
+            snprintf(msg,sizeof(msg),"SSH input resumed; queued %ums, EAGAIN %u, partial %u",
+                     (unsigned)(a->ssh_last_tx_progress_ms-a->ssh_tx_queued_ms),
+                     a->ssh_tx_eagain_count,a->ssh_tx_partial_count);
+            status_bar_only(a,msg);
+            a->ssh_tx_stall_reported=0;
+        }
         a->tx_len-=(size_t)n;
         if(a->tx_len)memmove(a->outgoing,a->outgoing+n,a->tx_len);
-    } else if(n!=LIBSSH2_ERROR_EAGAIN && n!=0){
+        else a->ssh_tx_queued_ms=0;
+    } else if(n==LIBSSH2_ERROR_EAGAIN || n==0){
+        a->ssh_tx_waiting=1;
+        if(n==LIBSSH2_ERROR_EAGAIN)a->ssh_tx_eagain_count++;
+    } else {
         a->stage=ST_FAILED;
         status(a,"SSH write error");
         disconnect(a);
@@ -1091,6 +1531,18 @@ static void ssh_pump(App *a) {
     /* Interactive SSH input gets the FIRST opportunity to use the socket. */
     ssh_flush_outgoing(a);
     if(a->stage!=ST_CONNECTED)return;
+    /* A delayed network must not block keyboard processing or rendering.
+       Do not discard queued keystrokes merely because the socket is busy. */
+    {unsigned int now=SDL_GetTicks();
+     if(a->tx_len && !a->ssh_tx_stall_reported &&
+        (unsigned)(now-a->ssh_last_tx_progress_ms)>=SSH_TX_STALL_NOTICE_MS){
+         a->ssh_tx_stall_reported=1;
+         {char msg[160];
+          snprintf(msg,sizeof(msg),"SSH input queued %ums; EAGAIN %u; partial %u",
+                   (unsigned)(now-a->ssh_tx_queued_since_ms),
+                   a->ssh_tx_eagain_count,a->ssh_tx_partial_count);
+          status_bar_only(a,msg);}
+     }}
 
     unsigned char data[4096];
     const unsigned int begin=SDL_GetTicks();
@@ -1105,11 +1557,26 @@ static void ssh_pump(App *a) {
         }
         else if(n==LIBSSH2_ERROR_EAGAIN || n==0)break;
         else {a->stage=ST_FAILED;status(a,"SSH read error");disconnect(a);return;}
-        /* Device input and redraw must get CPU time on an original Xbox. */
+        /* Bound SSH decoding per frame so input and screen redraw get CPU time. */
     }
     /* Answers to terminal status queries can be sent in the same frame. */
     ssh_flush_outgoing(a);
     if(a->stage!=ST_CONNECTED)return;
+    /* Periodic nonblocking SSH keepalive. EAGAIN means retry next tick;
+       a temporary wireless stall is not grounds to drop the connection. */
+    {unsigned int now=SDL_GetTicks();
+     if((unsigned)(now-a->ssh_last_keepalive_poll_ms)>=SSH_KEEPALIVE_POLL_MS){
+         int seconds_to_next=0;
+         int rc;
+         a->ssh_last_keepalive_poll_ms=now;
+         rc=libssh2_keepalive_send(a->session,&seconds_to_next);
+         if(rc!=0 && rc!=LIBSSH2_ERROR_EAGAIN){
+             a->stage=ST_FAILED;
+             status(a,"SSH keepalive failed; connection lost");
+             disconnect(a);
+             return;
+         }
+     }}
     if(libssh2_channel_eof(a->channel)){
         a->stage=ST_FAILED;status(a,"Remote shell closed");disconnect(a);
     }
@@ -1149,8 +1616,39 @@ static void toggle_theme(App *a){
     a->term.dirty=1;
     a->ui_status_dirty=1;
 }
+static void drum_notice(App *a){
+    snprintf(a->volume_status,sizeof(a->volume_status),"DRUM %s %d%%",a->drums.enabled?"ON":"OFF",a->drums.volume);
+    a->volume_status_until_ms=SDL_GetTicks()+2500u;a->ui_status_dirty=1;
+}
+static void drum_toggle(App *a){xssh_drums_toggle(&a->drums);drum_notice(a);}
+static int drum_pad(App *a,int pad){
+    if(!a->drums.enabled)return 0;
+    if(pad>0)xssh_drums_play(&a->drums,pad);
+    return 1;
+}
+static int drum_volume(App *a,int direction){
+    if(!a->drums.enabled)return 0;
+    xssh_drums_volume(&a->drums,direction);drum_notice(a);return 1;
+}
 static void keyboard_event(App*a,const SDL_KeyboardEvent *e) {
+    if((e->keysym.mod & (KMOD_CTRL|KMOD_SHIFT))==(KMOD_CTRL|KMOD_SHIFT) &&
+       e->keysym.sym==SDLK_o){
+        if(!e->repeat){
+            wallpaper_step(a);a->wallpaper_hold=1;
+            a->wallpaper_next_step=SDL_GetTicks()+130u;
+        }
+        return;
+    }
     if(e->repeat)return;
+    if((e->keysym.mod & (KMOD_CTRL|KMOD_SHIFT))==(KMOD_CTRL|KMOD_SHIFT) &&
+       e->keysym.sym==SDLK_m){wallpaper_margin_step(a);return;}
+    if((e->keysym.mod & (KMOD_CTRL|KMOD_SHIFT))==(KMOD_CTRL|KMOD_SHIFT) &&
+       e->keysym.sym==SDLK_b){wallpaper_next(a);return;}
+    if((e->keysym.mod & KMOD_CTRL) && e->keysym.sym==SDLK_SPACE){drum_toggle(a);return;}
+    if(e->keysym.sym>=SDLK_KP_1 && e->keysym.sym<=SDLK_KP_9 && drum_pad(a,(int)(e->keysym.sym-SDLK_KP_1)+1))return;
+    if(e->keysym.sym==SDLK_KP_0 && drum_pad(a,0))return;
+    if(e->keysym.sym==SDLK_KP_PLUS && drum_volume(a,1))return;
+    if(e->keysym.sym==SDLK_KP_MINUS && drum_volume(a,-1))return;
     if((e->keysym.mod & KMOD_CTRL) &&
        (e->keysym.sym==SDLK_EQUALS || e->keysym.sym==SDLK_PLUS ||
         e->keysym.sym==SDLK_KP_PLUS)){
@@ -1211,8 +1709,24 @@ static void keyboard_event(App*a,const SDL_KeyboardEvent *e) {
    sequences, including Ctrl+C, Ctrl+D, arrows, Home/End and function keys. */
 static void usb_key_event(void *ctx,XsshKeyEvent event) {
     App *a=(App*)ctx;
+    /* Drum controls must remain playable without waking the screensaver. */
+    if(event.kind==XSSH_KEY_WALLPAPER_MARGIN){wallpaper_margin_step(a);return;}
+    if(event.kind==XSSH_KEY_WALLPAPER_NEXT){wallpaper_next(a);return;}
+    if(event.kind==XSSH_KEY_WALLPAPER_OPACITY){
+        wallpaper_step(a);return;
+    }
+    if(event.kind==XSSH_KEY_DRUM_TOGGLE){drum_toggle(a);return;}
+    if(a->drums.enabled && event.kind==XSSH_KEY_DRUM_PAD){drum_pad(a,event.byte);return;}
+    if(a->drums.enabled && event.kind==XSSH_KEY_DRUM_UP){drum_volume(a,1);return;}
+    if(a->drums.enabled && event.kind==XSSH_KEY_DRUM_DOWN){drum_volume(a,-1);return;}
     a->last_input_ms=SDL_GetTicks();
     if(a->saver_active){saver_stop(a);return;}
+    if(event.kind==XSSH_KEY_DRUM_PAD){
+        if(!drum_pad(a,event.byte))type_byte(a,(unsigned char)('0'+event.byte));
+        return;
+    }
+    if(event.kind==XSSH_KEY_DRUM_UP){if(!drum_volume(a,1))type_byte(a,'+');return;}
+    if(event.kind==XSSH_KEY_DRUM_DOWN){if(!drum_volume(a,-1))type_byte(a,'-');return;}
     if(event.kind==XSSH_KEY_MUSIC_PREVIOUS){music_skip(a,-1);return;}
     if(event.kind==XSSH_KEY_MUSIC_NEXT){music_skip(a,1);return;}
     if(event.kind==XSSH_KEY_MUSIC_SEEK_BACK){music_seek(a,-1);return;}
@@ -1264,6 +1778,15 @@ static void usb_key_event(void *ctx,XsshKeyEvent event) {
     case XSSH_KEY_ENTER: enter(a);break;
     case XSSH_KEY_BACKSPACE: backspace(a);break;
     case XSSH_KEY_SEQUENCE: if(event.sequence)send_sequence(a,event.sequence);break;
+    case XSSH_KEY_DRUM_TOGGLE:
+    case XSSH_KEY_DRUM_PAD:
+    case XSSH_KEY_DRUM_UP:
+    case XSSH_KEY_DRUM_DOWN:
+    case XSSH_KEY_WALLPAPER_NEXT:
+    case XSSH_KEY_WALLPAPER_OPACITY:
+    case XSSH_KEY_WALLPAPER_MARGIN:
+        /* Already handled before this switch. */
+        break;
     }
 }
 static void poll_pad(App*a) {
@@ -1309,7 +1832,8 @@ static void poll_pad(App*a) {
     }
     if(pressed&(1u<<5)){
         if(a->stage==ST_CONNECTED){
-            disconnect(a);a->stage=ST_FORM;
+            disconnect(a);a->stage=ST_FORM;a->cache_valid=0;
+            a->last_render_ms=0;
             xssh_form_zero_password(&a->form);a->form.field=XSSH_FORM_HOST;
             status(a,"Disconnected; enter a new server or reconnect");
         } else if(a->stage==ST_VERIFY_HOST)reject_unknown_host(a);
@@ -1325,6 +1849,7 @@ int main(void) {
     if(!a)return 1;
     a->sock=-1;a->running=1;
     xssh_mp3_init(&a->music);
+    a->drums.volume=70;
     a->last_input_ms=SDL_GetTicks();
     term_init(&a->term);
     /* Read configuration before initializing video. This also leaves the safe
@@ -1332,31 +1857,65 @@ int main(void) {
     int settings_result = load_settings(&a->settings);
     int settings_ok = settings_result == 0;
     int cols=TERM_COLS, rows=TERM_ROWS;
+    if(!xssh_video_initialize(a->settings.video_mode,&a->video))return 1;
+    g_output_width=a->video.width;
+    g_output_height=a->video.height;
+    g_screen_width=g_output_width-2*(g_output_width*a->settings.wallpaper_margin/100);
+    g_screen_height=g_output_height-2*(g_output_height*a->settings.wallpaper_margin/100);
     a->term_height=PAD_TERMINAL_HEIGHT;
-    xssh_font_layout_for_height(a->settings.font_size,a->term_height,
+    xssh_font_layout_for_area(a->settings.font_size,WIDTH,a->term_height,
                      &a->terminal_glyph_w,&a->terminal_glyph_h,&cols,&rows);
     if(!term_set_size(&a->term,cols,rows))return 1;
-    if(!xssh_video_initialize(a->settings.video_mode,&a->video))return 1;
     if(SDL_Init(SDL_INIT_VIDEO|SDL_INIT_GAMECONTROLLER|SDL_INIT_EVENTS)<0)return 1;
     a->last_input_ms=SDL_GetTicks();
-    a->window=SDL_CreateWindow("XSSH",SDL_WINDOWPOS_UNDEFINED,SDL_WINDOWPOS_UNDEFINED,
-                               a->video.width,a->video.height,SDL_WINDOW_SHOWN);
-    if(!a->window)return 1;
-    a->renderer=SDL_CreateRenderer(a->window,-1,0);
-    if(!a->renderer)return 1;
-    /* Keep the logical 640x480 UI at 480i through 1080i and custom modes.
-       The terminal font size changes the grid, not the physical video mode. */
-    if(SDL_RenderSetLogicalSize(a->renderer,WIDTH,HEIGHT)!=0)return 1;
+    /* Keep SDL's event/keyboard subsystem, but render to a RAM surface when
+       using pbGL. Only pbGL/pbkit owns scanout in GPU mode. */
+    /* At 1920x1080 the 40 GPU tiles, software staging surface and pbkit
+       scanout buffers can exhaust NV2A's available video/contiguous memory.
+       Use the stable SDL renderer for 1080i pending validated paging support. */
+    if(a->settings.gpu_acceleration && a->video.width<1920 &&
+       a->video.height<1080){
+        a->gpu_surface=SDL_CreateRGBSurface(0,a->video.width,a->video.height,32,
+                                           0x000000ff,0x0000ff00,0x00ff0000,0xff000000);
+        if(a->gpu_surface)
+            a->renderer=SDL_CreateSoftwareRenderer(a->gpu_surface);
+        if(a->renderer && xssh_gpu_init(&a->gpu,a->video.width,a->video.height)==0)
+            a->gpu_active=1;
+        else {
+            if(a->renderer){SDL_DestroyRenderer(a->renderer);a->renderer=NULL;}
+            if(a->gpu_surface){SDL_FreeSurface(a->gpu_surface);a->gpu_surface=NULL;}
+        }
+    }
+    if(!a->gpu_active){
+        a->window=SDL_CreateWindow("XSSH",SDL_WINDOWPOS_UNDEFINED,SDL_WINDOWPOS_UNDEFINED,
+                                   a->video.width,a->video.height,SDL_WINDOW_SHOWN);
+        if(!a->window)return 1;
+        a->renderer=SDL_CreateRenderer(a->window,-1,0);
+        if(!a->renderer)return 1;
+    }
+    /* Render at the selected dashboard video mode, without 640x480 upscaling.
+       Terminal rows/columns are calculated from the actual pixel dimensions. */
+    /* Native coordinates; margins use an inset viewport without scaling. */
     /* Nearest-neighbor sampling must be set before creating font textures. */
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY,"0");
     if(init_font(a))return 1;
-    a->term_cache=SDL_CreateTexture(a->renderer,SDL_PIXELFORMAT_RGBA8888,
-                                    SDL_TEXTUREACCESS_TARGET,WIDTH,USB_TERMINAL_HEIGHT);
-    if(a->term_cache)SDL_SetTextureBlendMode(a->term_cache,SDL_BLENDMODE_NONE);
+    a->wallpaper_opacity=a->settings.wallpaper_opacity;
+    a->wallpaper_margin=a->settings.wallpaper_margin;
+    a->margin_effects_wallpaper=a->settings.margin_effects_wallpaper;
+    if(a->settings.wallpaper_file[0]){
+        if(!wallpaper_load(a,a->settings.wallpaper_file))wallpaper_next(a);
+    }else wallpaper_next(a);
+    if(!a->gpu_active){
+        a->term_cache=SDL_CreateTexture(a->renderer,SDL_PIXELFORMAT_RGBA8888,
+                                        SDL_TEXTUREACCESS_TARGET,WIDTH,USB_TERMINAL_HEIGHT);
+        if(a->term_cache)SDL_SetTextureBlendMode(a->term_cache,SDL_BLENDMODE_NONE);
+    }
     /* Always show an editable login form, even if configuration, network,
        or seed initialization fails. The status bar explains the blocker. */
     a->stage=ST_FORM;
     logline(a,"XSSH: original Xbox SSH2 terminal / interactive login v3");
+    logline(a,a->gpu_active?"Video renderer: NV2A pbGL (GPU tiles)":
+                          "Video renderer: SDL2 software (GPU disabled/fallback)");
     logline(a,XSSH_BUILD_ID);
     {char info[100];
      snprintf(info,sizeof(info),"Video: %s; font: %d; terminal: %dx%d",
@@ -1401,12 +1960,41 @@ int main(void) {
        disables SDL's 500ms early joystick enumeration for this reason. */
     xssh_usb_keyboard_init();
     SDL_StartTextInput();
+    snprintf(a->cpu_status,sizeof(a->cpu_status),"CPU --%%");
+    a->cpu_sample_start_ticks=SDL_GetPerformanceCounter();
+    a->last_rendered_stage=(Stage)-1;
     while(a->running){
+        uint64_t cpu_loop_start=SDL_GetPerformanceCounter();
         SDL_Event ev;
         while(SDL_PollEvent(&ev)){
+            if(ev.type==SDL_TEXTINPUT && a->swallow_drum_text){
+                a->swallow_drum_text=0;continue;
+            }
+            if(ev.type==SDL_KEYUP && (ev.key.keysym.sym==SDLK_o ||
+               ev.key.keysym.sym==SDLK_LCTRL || ev.key.keysym.sym==SDLK_RCTRL ||
+               ev.key.keysym.sym==SDLK_LSHIFT || ev.key.keysym.sym==SDLK_RSHIFT))
+                a->wallpaper_hold=0;
+            if(ev.type==SDL_KEYDOWN)a->swallow_drum_text=0;
             if(ev.type==SDL_TEXTINPUT && a->swallow_wake_text){
                 a->swallow_wake_text=0;
                 continue;
+            }
+            /* Process active drum controls before the generic screensaver wake
+               handler.  They neither dismiss the saver nor reset idle time. */
+            if(ev.type==SDL_KEYDOWN){
+                SDL_Keycode sym=ev.key.keysym.sym;
+                int wallpaper_shortcut=(ev.key.keysym.mod & (KMOD_CTRL|KMOD_SHIFT))==
+                    (KMOD_CTRL|KMOD_SHIFT) && (sym==SDLK_b || sym==SDLK_o || sym==SDLK_m);
+                if(wallpaper_shortcut){a->swallow_drum_text=1;keyboard_event(a,&ev.key);continue;}
+                int toggle=(ev.key.keysym.mod & KMOD_CTRL) && sym==SDLK_SPACE;
+                int drum_key=a->drums.enabled &&
+                    ((sym>=SDLK_KP_0 && sym<=SDLK_KP_9) ||
+                     sym==SDLK_KP_PLUS || sym==SDLK_KP_MINUS);
+                if(toggle || drum_key){
+                    a->swallow_drum_text=1;
+                    keyboard_event(a,&ev.key);
+                    continue;
+                }
             }
             if(ev.type==SDL_KEYDOWN || ev.type==SDL_TEXTINPUT || ev.type==SDL_CONTROLLERBUTTONDOWN){
                 a->last_input_ms=SDL_GetTicks();
@@ -1417,12 +2005,28 @@ int main(void) {
                 if(ev.type==SDL_KEYDOWN)a->swallow_wake_text=0;
             }
             if(ev.type==SDL_QUIT)a->running=0;
-            else if(ev.type==SDL_KEYDOWN)keyboard_event(a,&ev.key);
+            else if(ev.type==SDL_KEYDOWN){
+                SDL_Keycode sym=ev.key.keysym.sym;
+                if((ev.key.keysym.mod & KMOD_CTRL) && sym==SDLK_SPACE)
+                    a->swallow_drum_text=1;
+                else if(a->drums.enabled && ((sym>=SDLK_KP_0 && sym<=SDLK_KP_9) ||
+                        sym==SDLK_KP_PLUS || sym==SDLK_KP_MINUS))a->swallow_drum_text=1;
+                keyboard_event(a,&ev.key);
+            }
             else if(ev.type==SDL_TEXTINPUT && (a->stage==ST_FORM || a->stage==ST_CONNECTED)){
                 for(const unsigned char *p=(const unsigned char*)ev.text.text;*p;p++)
                     if(*p>=32&&*p<127 && !(a->stage==ST_FORM && a->menu_focus))type_byte(a,*p);
             }
         }
+        if(a->wallpaper_hold){
+            unsigned int t=SDL_GetTicks();
+            if((int32_t)(t-a->wallpaper_next_step)>=0){
+                wallpaper_step(a);a->wallpaper_next_step=t+130u;
+            }
+        }
+        /* Send SDL keyboard input before USB polling, network maintenance,
+           terminal reads, audio work or rendering can delay it. */
+        ssh_flush_outgoing(a);
         {unsigned int now=SDL_GetTicks();
          if(now-a->last_network_poll>=500){
              a->last_network_poll=now;
@@ -1430,8 +2034,11 @@ int main(void) {
          }
          xssh_usb_keyboard_poll(now,usb_key_event,a);}
         poll_pad(a);
+        /* USB HID and controller input are also sent in the same iteration. */
+        ssh_flush_outgoing(a);
         resize_for_keyboard(a,0);
         ssh_pump(a);
+        xssh_drums_pump(&a->drums);
         xssh_mp3_pump(&a->music);
         {char mp3_notice[160];
          if(xssh_mp3_take_status(&a->music,mp3_notice,sizeof(mp3_notice)))
@@ -1466,13 +2073,24 @@ int main(void) {
             on the next ~30 FPS boundary. */
          /* Limit animation work during music, but keep drawing even if
             the audio queue stalls or drains at the end of a song. */
-         unsigned render_interval=a->saver_active ?
-             (xssh_mp3_is_playing(&a->music) ? 160u : 33u) : 16u;
+         /* The GPU screensaver blits one native-size texture; do not force
+            it down to ~6 FPS just because MP3 audio is playing. */
+         /* 1080i has four times the pixel count of 540p and SDL is CPU
+            rendered here for safety. Do not repeatedly redraw an unchanged
+            login form at 60 FPS; redraw promptly for input/status changes.
+            Connected sessions retain their existing dirty-cell behavior. */
+         int high_res_sdl=!a->gpu_active && a->video.width>=1920 && a->video.height>=1080;
+         unsigned render_interval=a->saver_active ? (high_res_sdl?50u:33u) :
+                                  (high_res_sdl?33u:16u);
          if(now-a->last_render_ms>=render_interval){
              if(a->saver_active){
                  saver_draw(a,now);a->last_render_ms=now;
              }
-             else if(a->stage!=ST_CONNECTED || a->term.dirty || !a->cache_valid || a->cache_scan_active || a->ui_status_dirty){
+             else if(a->stage!=ST_CONNECTED ?
+                 (!high_res_sdl || a->stage!=a->last_rendered_stage ||
+                  a->last_render_ms==0 || a->last_input_ms>=a->last_render_ms ||
+                  a->ui_status_dirty || a->font_resize_pending) :
+                 (a->term.dirty || !a->cache_valid || a->cache_scan_active || a->ui_status_dirty)){
                  /* Never gate keyboard echo or terminal repaint on audio queue
                     occupancy: a low/failed queue could otherwise freeze the
                     display indefinitely. Audio has its own worker. */
@@ -1480,11 +2098,33 @@ int main(void) {
              }
          }
         }
+        if(!a->running && !xssh_drums_shutdown(&a->drums)){
+            a->running=1;
+            status_bar_only(a,"Drum audio shutdown pending; exit again when stopped");
+        }
         if(!a->running && !xssh_mp3_stop(&a->music)){
             a->running=1;
             status_bar_only(a,"Audio shutdown pending; exit again when stopped");
         }
+        /* Approximate application CPU load from time spent working versus
+           time yielded by SDL_Delay. This is not whole-system CPU usage. */
+        uint64_t cpu_before_yield=SDL_GetPerformanceCounter();
         SDL_Delay(2);
+        uint64_t cpu_after_yield=SDL_GetPerformanceCounter();
+        a->cpu_busy_ticks+=cpu_before_yield-cpu_loop_start;
+        a->cpu_total_ticks+=cpu_after_yield-cpu_loop_start;
+        uint64_t cpu_frequency=SDL_GetPerformanceFrequency();
+        if(cpu_frequency &&
+           cpu_after_yield-a->cpu_sample_start_ticks>=cpu_frequency){
+            unsigned percent=a->cpu_total_ticks ?
+                (unsigned)((a->cpu_busy_ticks*100u+a->cpu_total_ticks/2u)/a->cpu_total_ticks) : 0u;
+            if(percent>100u)percent=100u;
+            snprintf(a->cpu_status,sizeof(a->cpu_status),"CPU %u%%",percent);
+            a->cpu_busy_ticks=0;
+            a->cpu_total_ticks=0;
+            a->cpu_sample_start_ticks=cpu_after_yield;
+            a->ui_status_dirty=1;
+        }
     }
     saver_stop(a);
     xssh_led_restore();
@@ -1492,9 +2132,13 @@ int main(void) {
     libssh2_exit();
     if(a->pad)SDL_GameControllerClose(a->pad);
     if(a->term_cache)SDL_DestroyTexture(a->term_cache);
+    if(a->wallpaper_texture)SDL_DestroyTexture(a->wallpaper_texture);
     if(a->font)SDL_DestroyTexture(a->font);
     if(a->font_aa)SDL_DestroyTexture(a->font_aa);
-    SDL_DestroyRenderer(a->renderer);SDL_DestroyWindow(a->window);
+    SDL_DestroyRenderer(a->renderer);
+    if(a->gpu_active)xssh_gpu_shutdown(&a->gpu);
+    if(a->gpu_surface)SDL_FreeSurface(a->gpu_surface);
+    if(a->window)SDL_DestroyWindow(a->window);
     SDL_Quit();free(a);
     return 0;
 }
