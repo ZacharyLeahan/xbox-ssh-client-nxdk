@@ -1056,6 +1056,9 @@ static void render(App *a) {
         SDL_RenderCopy(a->renderer,a->wallpaper_texture,NULL,&wallpaper_dest);
     }
     text_at(a,8,6,XSSH_UI_LABEL,c.foreground,25);
+    /* nxdk's Xbox driver retains only the latest USB report until sampled.
+       Queue transitions between the expensive software drawing phases. */
+    if(a->pad)SDL_JoystickUpdate();
     {char video_font[48];
      snprintf(video_font,sizeof(video_font),"%s F%d %s AA:%s",a->video.description,a->settings.font_size,
               xssh_font_style_name(a->settings.font_style),a->settings.text_antialiasing?"ON":"OFF");
@@ -1194,6 +1197,7 @@ static void render(App *a) {
     if(a->gpu_active){
         /* Flush SDL's software command queue before NV2A reads the pixels. */
         SDL_RenderPresent(a->renderer);
+        if(a->pad)SDL_JoystickUpdate();
         xssh_gpu_present(&a->gpu,a->gpu_surface);
     }else SDL_RenderPresent(a->renderer);
     a->last_rendered_stage=a->stage;
@@ -1829,6 +1833,17 @@ static void usb_key_event(void *ctx,XsshKeyEvent event) {
         break;
     }
 }
+static void pad_direction(App *a,SDL_GameControllerButton button){
+    int dx=(button==SDL_CONTROLLER_BUTTON_DPAD_RIGHT)-(button==SDL_CONTROLLER_BUTTON_DPAD_LEFT);
+    int dy=(button==SDL_CONTROLLER_BUTTON_DPAD_DOWN)-(button==SDL_CONTROLLER_BUTTON_DPAD_UP);
+    if(!dx && !dy)return;
+    if(a->stage==ST_FORM && a->menu_focus){
+        a->menu_action=(a->menu_action+dx+4)%4;
+        a->ui_status_dirty=1;
+    }else if(a->stage!=ST_POWER_CONFIRM && xssh_software_keyboard_visible()){
+        nav(a,dx,dy);
+    }
+}
 static void poll_pad(App*a) {
     if(a->pad && !SDL_GameControllerGetAttached(a->pad)){
         SDL_GameControllerClose(a->pad);
@@ -1861,7 +1876,9 @@ static void poll_pad(App*a) {
     };
     unsigned int now=0;
     for(int i=0;i<10;i++)if(SDL_GameControllerGetButton(a->pad,buttons[i]))now |= (1u<<i);
-    unsigned int pressed=now & ~a->pad_old;
+    /* Direction presses are dispatched in SDL event order, including taps
+       released before this poll. Use the live state only for held repeats. */
+    unsigned int pressed=(now & ~a->pad_old) & ~(15u<<6);
     unsigned int directions=now & (15u<<6);
     unsigned int ticks=SDL_GetTicks();
     if(directions!=(a->pad_old & (15u<<6))){
@@ -1887,8 +1904,7 @@ static void poll_pad(App*a) {
     }
     if(a->stage==ST_FORM && a->menu_focus){
         if(pressed&(1u<<0) || pressed&(1u<<1))startup_action(a,a->menu_action);
-        if(pressed&(1u<<6))a->menu_action=(a->menu_action+3)%4;
-        if(pressed&(1u<<7))a->menu_action=(a->menu_action+1)%4;
+        for(int i=6;i<10;i++)if(pressed&(1u<<i))pad_direction(a,buttons[i]);
         if(pressed&(1u<<4) || pressed&(1u<<5))a->menu_focus=0;
         return;
     }
@@ -1909,10 +1925,7 @@ static void poll_pad(App*a) {
         } else if(a->stage==ST_VERIFY_HOST)reject_unknown_host(a);
         else if(a->stage==ST_FORM)a->menu_focus=1;
     }
-    if(software_keyboard && (pressed&(1u<<6)))nav(a,-1,0);
-    if(software_keyboard && (pressed&(1u<<7)))nav(a,1,0);
-    if(software_keyboard && (pressed&(1u<<8)))nav(a,0,-1);
-    if(software_keyboard && (pressed&(1u<<9)))nav(a,0,1);
+    for(int i=6;i<10;i++)if(pressed&(1u<<i))pad_direction(a,buttons[i]);
 }
 int main(void) {
     App *a=(App*)calloc(1,sizeof(App));
@@ -2075,6 +2088,10 @@ int main(void) {
                 if(ev.type==SDL_KEYDOWN)a->swallow_wake_text=0;
             }
             if(ev.type==SDL_QUIT)a->running=0;
+            else if(ev.type==SDL_CONTROLLERBUTTONDOWN && a->pad &&
+                    ev.cbutton.which==SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(a->pad))){
+                pad_direction(a,(SDL_GameControllerButton)ev.cbutton.button);
+            }
             else if(ev.type==SDL_KEYDOWN){
                 SDL_Keycode sym=ev.key.keysym.sym;
                 if((ev.key.keysym.mod & KMOD_CTRL) && sym==SDLK_SPACE)
